@@ -45,3 +45,5 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`🚀 سرور روی پورت ${PORT} روشن شد!`);
 });
+
+module.exports = app;
