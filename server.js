@@ -226,12 +226,67 @@ app.delete('/api/students/:studentId', async (req, res) => {
 });
 
 // ============================================================================
-// مسیر دستیار هوشمند خوابگاهی و آموزشی (Gemini 3.8 Flash + Google Search)
+// کمک‌تابع خواندن خلاصه عمومی ایمن از دیتابیس (بدون اطلاعات حساس یا هویتی)
+// ============================================================================
+async function getSafeDbPublicSummary() {
+  try {
+    await connectToDatabase();
+    const docs = await SyncData.find({
+      key: {
+        $in: [
+          'farhangian_dorm_dormitories_prod',
+          'farhangian_dorm_announcements_prod',
+          'farhangian_dorm_settings_prod',
+        ],
+      },
+    }).lean();
+
+    const dbSummary = {};
+    for (const doc of docs) {
+      if (doc.key === 'farhangian_dorm_dormitories_prod' && Array.isArray(doc.value)) {
+        dbSummary.dormitories = doc.value.map((d) => ({
+          name: d?.name || '',
+          campus: d?.campus || '',
+          gender: d?.gender === 'brothers' ? 'برادران' : 'خواهران',
+          totalFloors: d?.totalFloors || 0,
+        }));
+      } else if (doc.key === 'farhangian_dorm_announcements_prod' && Array.isArray(doc.value)) {
+        dbSummary.announcements = doc.value
+          .filter((a) => a?.showOnHomePage !== false)
+          .slice(0, 10)
+          .map((a) => ({
+            title: a?.title || '',
+            content: a?.content || '',
+            date: a?.date || '',
+            priority: a?.priority || 'normal',
+          }));
+      } else if (doc.key === 'farhangian_dorm_settings_prod' && doc.value) {
+        // دقت: رمز عبور مدیر (adminPassword) به هیچ وجه استخراج نمی‌شود
+        dbSummary.settings = {
+          universityName: doc.value.universityName || '',
+          currentAcademicYear: doc.value.currentAcademicYear || '',
+          currentSemester: doc.value.currentSemester || '',
+          selectionActive: Boolean(doc.value.selectionActive),
+          selectionStartDate: doc.value.selectionStartDate || '',
+          selectionEndDate: doc.value.selectionEndDate || '',
+        };
+      }
+    }
+    return dbSummary;
+  } catch (err) {
+    console.warn('getSafeDbPublicSummary warning:', err.message);
+    return null;
+  }
+}
+
+// ============================================================================
+// مسیر دستیار هوشمند خوابگاهی و آموزشی با Groq API (llama-3.3-70b-versatile)
 // ============================================================================
 app.get('/api/ai-chat', (req, res) => {
   res.json({
     ok: true,
-    model: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
+    provider: 'Groq',
+    model: 'llama-3.3-70b-versatile',
     message: 'برای گفتگو با دستیار هوشمند از متد POST استفاده کنید.',
   });
 });
@@ -244,137 +299,96 @@ app.post('/api/ai-chat', async (req, res) => {
       return res.status(400).json({ error: 'متن پیام کاربر نمی‌تواند خالی باشد.' });
     }
 
-    // کلید فقط از متغیرهای محیطی امن Vercel خوانده می‌شود (بدون هیچ کلیدی در کد)
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = (
+      process.env.GROQ_API_KEY ||
+      process.env.GEMINI_API_KEY ||
+      ''
+    ).trim();
+
     if (!apiKey) {
       return res.status(500).json({
         error:
-          'کلید GEMINI_API_KEY در تنظیمات Environment Variables پروژه Vercel تعریف نشده است.',
+          'کلید API هوش مصنوعی (GROQ_API_KEY یا GEMINI_API_KEY) در تنظیمات Environment Variables پروژه Vercel تعریف نشده است.',
       });
     }
 
-    const geminiModel = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+    const hasClientContext =
+      publicContext &&
+      typeof publicContext === 'object' &&
+      Object.keys(publicContext).length > 0;
+    const dbFallbackSummary = hasClientContext
+      ? null
+      : await getSafeDbPublicSummary();
 
-    const systemInstructionText = [
-      'تو دستیار هوشمند جامع خوابگاهی و آموزشی «سامانه جامع سراهای دانشجویی دانشگاه فرهنگیان استان اصفهان» هستی.',
-      'به زبان فارسی روان، دقیق، صمیمی و محترمانه پاسخ بده.',
+    const contextData = hasClientContext ? publicContext : dbFallbackSummary || {};
+
+    const systemPrompt = [
+      'تو دستیار هوشمند خوابگاهی و آموزشی «سامانه جامع سراهای دانشجویی دانشگاه فرهنگیان استان اصفهان» هستی.',
+      'وظیفه تو پاسخگویی دقیق، محترمانه و روان به زبان فارسی به سوالات دانشجویان، سرپرستان و مراجعان درباره امور سراها، اسکان، اتاق‌ها، ظرفیت‌ها، میانگین نمرات ارزیابی اتاق‌ها، اطلاعیه‌ها، برنامه حضور سرپرستان و مشاوران و همچنین سوالات عمومی آموزشی، علمی و خوابگاهی است.',
       '',
-      'حوزه پاسخگویی:',
-      '۱. هیچ محدودیت موضوعی نداری: به هر سوالی درباره وضعیت سراها، ظرفیت اتاق‌ها و تخت‌های خالی/پر، امکانات اتاق‌ها، رشته‌ها و ورودی‌های مجاز، میانگین امتیاز سال قبل یا میانگین نمرات ارزیابی اتاق‌ها، اطلاعیه‌ها، زمان‌بندی انتخاب اتاق و برنامه حضور سرپرستان و مشاوران بر اساس داده‌های لحظه‌ای سامانه (publicContext) به دقت پاسخ بده.',
-      '۲. برای سوالات آموزشی، علمی، پژوهشی، آیین‌نامه‌های دانشگاه فرهنگیان، امور دانشجویی، تغذیه، سلامت روان و یا هر سوال عمومی و روز دیگری که فراتر از داده‌های درون سامانه است، از ابزار جستجوی اینترنتی (Google Search) استفاده کن و پاسخ به‌روز و مستند ارائه بده.',
+      'قوانین اکید امنیتی و حفظ حریم خصوصی (بسیار مهم):',
+      '۱. هرگز اطلاعات حساس و شخصی کاربران از جمله کد ملی، شماره موبایل، تلفن ثابت، شماره والدین/اضطراری، رمز عبور، نشانی منزل، پیام‌های خصوصی مشاوره و اخطارهای انضباطی را افشا نکن.',
+      '۲. هرگز نام یا محل اسکان سایر دانشجویان (اینکه چه کسی در کدام اتاق یا تخت ساکن است) را فاش نکن. در پاسخ به پرسش درباره اتاق‌ها فقط آمار ظرفیت کل، تعداد پر و خالی، امکانات، رشته‌های مجاز و میانگین ناشناس نمرات را ارائه بده.',
+      '۳. تنها در صورتی که در بخش currentUserContext اطلاعات خودِ دانشجوی لاگین‌شده موجود باشد، می‌توانی درباره وضعیت اسکان، اتاق، تخت و نمرات ارزیابیِ خودِ همان دانشجو پاسخ دهی.',
+      '۴. اگر داده‌ای در اطلاعات سامانه وجود ندارد، صادقانه بیان کن و از حدس زدن آمار نادرست خودداری کن.',
       '',
-      'قوانین اکید حفظ حریم خصوصی و امنیت:',
-      '- هرگز اطلاعات شخصی، هویتی یا محرمانه دانشجویان و کارکنان را فاش نکن؛ از جمله کد ملی، شماره موبایل، تلفن ثابت، تلفن والدین/اضطراری، نشانی منزل، رمز عبور، پیام‌های خصوصی مشاوره و اخطارهای انضباطی.',
-      '- هرگز اسامی ساکنین یک اتاق یا تخت خاص را برای دیگران افشا نکن. اگر کاربری پرسید «چه کسانی در فلان اتاق ساکن هستند؟»، محترمانه توضیح بده که به دلیل حفظ حریم خصوصی، نمایش اسامی ساکنین اتاق‌ها مجاز نیست و فقط تعداد نفرات ساکن، ظرفیت خالی، امکانات و میانگین امتیاز اتاق قابل ارائه است.',
-      '- تنها در صورتی که در بخش currentUserContext اطلاعات خودِ دانشجوی لاگین‌شده ارسال شده باشد، می‌توانی درباره وضعیت اسکان، اتاق، تخت و نمرات ارزیابیِ خودِ او پاسخ دهی.',
-      '- اگر درباره موضوعی در داده‌های سامانه اطلاعاتی وجود ندارد، صادقانه اطلاع بده و از حدس زدن آمار جعلی خودداری کن.',
+      `اطلاعات عمومی و مجاز سامانه:\n${JSON.stringify(contextData)}`,
     ].join('\n');
 
-    // مرتب‌سازی تاریخچه برای اطمینان از تناوب صحیح user -> model در Gemini API
-    const contents = [];
+    const messages = [{ role: 'system', content: systemPrompt }];
+
+    // افزودن تاریخچه مکالمه قبلی با فرمت استاندارد OpenAI/Groq
     if (Array.isArray(history)) {
-      for (const turn of history.slice(-10)) {
-        if (
-          turn &&
-          typeof turn.text === 'string' &&
-          turn.text.trim() &&
-          (turn.role === 'user' || turn.role === 'model')
-        ) {
-          if (contents.length === 0 && turn.role !== 'user') {
-            continue;
-          }
-          const prev = contents[contents.length - 1];
-          if (prev && prev.role === turn.role) {
-            prev.parts[0].text += `\n${turn.text.trim()}`;
-          } else {
-            contents.push({
-              role: turn.role,
-              parts: [{ text: turn.text.trim() }],
-            });
-          }
+      for (const turn of history.slice(-8)) {
+        if (turn && typeof turn.text === 'string' && turn.text.trim()) {
+          messages.push({
+            role: turn.role === 'model' || turn.role === 'assistant' ? 'assistant' : 'user',
+            content: turn.text.trim(),
+          });
         }
       }
     }
 
-    const contextString = JSON.stringify(publicContext || {});
-    const enrichedUserPrompt =
-      `اطلاعات عمومی و به‌روز سامانه (بدون اطلاعات حساس):\n${contextString}\n\n` +
-      `پرسش کاربر:\n${message.trim()}`;
-
-    if (contents.length > 0 && contents[contents.length - 1].role === 'user') {
-      contents[contents.length - 1].parts[0].text += `\n\n${enrichedUserPrompt}`;
-    } else {
-      contents.push({
-        role: 'user',
-        parts: [{ text: enrichedUserPrompt }],
-      });
-    }
-
-    const geminiRequestBody = {
-      system_instruction: {
-        parts: [{ text: systemInstructionText }],
-      },
-      contents,
-      tools: [{ google_search: {} }],
-      generationConfig: {
-        temperature: 0.5,
-        maxOutputTokens: 2048,
-      },
-    };
-
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-      geminiModel
-    )}:generateContent`;
-
-    const aiResponse = await fetch(geminiUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey,
-      },
-      body: JSON.stringify(geminiRequestBody),
+    messages.push({
+      role: 'user',
+      content: message.trim(),
     });
 
-    const aiData = await aiResponse.json().catch(() => ({}));
+    const groqResponse = await fetch(
+      'https://api.groq.com/openai/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer ' + apiKey,
+        },
+        body: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          messages,
+          temperature: 0.5,
+          max_tokens: 1024,
+        }),
+      }
+    );
 
-    if (!aiResponse.ok) {
-      console.error('Gemini API Error:', aiResponse.status, aiData);
-      return res.status(aiResponse.status || 502).json({
+    const data = await groqResponse.json().catch(() => ({}));
+
+    if (!groqResponse.ok) {
+      console.error('Groq API Error:', groqResponse.status, data);
+      return res.status(groqResponse.status || 502).json({
         error:
-          aiData?.error?.message ||
-          'خطا در دریافت پاسخ از سرویس هوش مصنوعی Gemini.',
+          data?.error?.message ||
+          'خطا در دریافت پاسخ از سرویس هوش مصنوعی Groq.',
       });
     }
 
-    const candidate = aiData?.candidates?.[0];
-    const parts = candidate?.content?.parts || [];
-    const reply = parts
-      .map((p) => (typeof p?.text === 'string' ? p.text : ''))
-      .join('\n')
-      .trim();
-
-    // استخراج لینک منابع جستجوی گوگل
-    const rawChunks = candidate?.groundingMetadata?.groundingChunks || [];
-    const seenUris = new Set();
-    const sources = [];
-
-    for (const chunk of rawChunks) {
-      const uri = chunk?.web?.uri;
-      const title = chunk?.web?.title;
-      if (uri && typeof uri === 'string' && !seenUris.has(uri)) {
-        seenUris.add(uri);
-        sources.push({
-          title: (typeof title === 'string' && title.trim()) || uri,
-          uri,
-        });
-      }
-    }
+    const reply =
+      data?.choices?.[0]?.message?.content?.trim() ||
+      'متأسفانه پاسخی از دستیار هوشمند دریافت نشد. لطفاً دوباره تلاش کنید.';
 
     return res.json({
-      reply:
-        reply ||
-        'متأسفانه در حال حاضر پاسخی تولید نشد. لطفاً سوال خود را با جزئیات بیشتر بپرسید.',
-      sources,
+      success: true,
+      reply,
     });
   } catch (error) {
     console.error('POST /api/ai-chat error:', error);
@@ -385,7 +399,7 @@ app.post('/api/ai-chat', async (req, res) => {
   }
 });
 
-// اجرای محلی
+// اجرای محلی برای تست
 if (require.main === module) {
   const PORT = process.env.PORT || 3001;
   app.listen(PORT, () => {
