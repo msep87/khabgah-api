@@ -4,7 +4,7 @@ const cors = require('cors');
 
 const app = express();
 
-// تنظیمات CORS و محدودیت حجم بدنه برای پشتیبانی از تصاویر/فونت‌ها و کانتکست چت
+// تنظیمات CORS و محدودیت حجم بدنه
 app.use(
   cors({
     origin: '*',
@@ -16,7 +16,7 @@ app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
 // ============================================================================
-// اتصال کش‌شده به MongoDB Atlas (بهینه‌شده برای محیط Serverless Vercel)
+// اتصال کش‌شده به MongoDB Atlas (فقط از متغیر محیطی Vercel خوانده می‌شود)
 // ============================================================================
 const MONGODB_URI =
   process.env.MONGODB_URI || process.env.MONGO_URI || process.env.DATABASE_URL;
@@ -31,7 +31,7 @@ async function connectToDatabase() {
     return cached.conn;
   }
   if (!MONGODB_URI) {
-    throw new Error('متغیر محیطی MONGODB_URI در تنظیمات سرور تعریف نشده است.');
+    throw new Error('متغیر محیطی MONGODB_URI در تنظیمات Vercel تعریف نشده است.');
   }
   if (!cached.promise) {
     cached.promise = mongoose
@@ -46,7 +46,7 @@ async function connectToDatabase() {
 }
 
 // ============================================================================
-// مدل‌های دیتابیس MongoDB (سازگار با کلید-مقدارهای همگام‌سازی و مجموعه دانشجویان)
+// مدل‌های دیتابیس MongoDB
 // ============================================================================
 const syncDataSchema = new mongoose.Schema(
   {
@@ -226,8 +226,16 @@ app.delete('/api/students/:studentId', async (req, res) => {
 });
 
 // ============================================================================
-// مسیر جدید دستیار هوشمند خوابگاهی و آموزشی مجهز به Gemini و جستجوی زنده وب
+// مسیر دستیار هوشمند خوابگاهی و آموزشی (Gemini 3.8 Flash + Google Search)
 // ============================================================================
+app.get('/api/ai-chat', (req, res) => {
+  res.json({
+    ok: true,
+    model: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
+    message: 'برای گفتگو با دستیار هوشمند از متد POST استفاده کنید.',
+  });
+});
+
 app.post('/api/ai-chat', async (req, res) => {
   try {
     const { message, history = [], publicContext = {} } = req.body || {};
@@ -236,9 +244,16 @@ app.post('/api/ai-chat', async (req, res) => {
       return res.status(400).json({ error: 'متن پیام کاربر نمی‌تواند خالی باشد.' });
     }
 
-    const apiKey =
-      process.env.GEMINI_API_KEY ||
-      'AQ.Ab8RN6Lu79h4vT24VwbbhLH5RSo_eIWSnZCCVIcQWPJ6_kolwQ';
+    // کلید فقط از متغیرهای محیطی امن Vercel خوانده می‌شود (بدون هیچ کلیدی در کد)
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({
+        error:
+          'کلید GEMINI_API_KEY در تنظیمات Environment Variables پروژه Vercel تعریف نشده است.',
+      });
+    }
+
+    const geminiModel = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
 
     const systemInstructionText = [
       'تو دستیار هوشمند جامع خوابگاهی و آموزشی «سامانه جامع سراهای دانشجویی دانشگاه فرهنگیان استان اصفهان» هستی.',
@@ -255,7 +270,7 @@ app.post('/api/ai-chat', async (req, res) => {
       '- اگر درباره موضوعی در داده‌های سامانه اطلاعاتی وجود ندارد، صادقانه اطلاع بده و از حدس زدن آمار جعلی خودداری کن.',
     ].join('\n');
 
-    // تبدیل تاریخچه گفتگو به ساختار استاندارد Gemini REST API
+    // مرتب‌سازی تاریخچه برای اطمینان از تناوب صحیح user -> model در Gemini API
     const contents = [];
     if (Array.isArray(history)) {
       for (const turn of history.slice(-10)) {
@@ -265,23 +280,35 @@ app.post('/api/ai-chat', async (req, res) => {
           turn.text.trim() &&
           (turn.role === 'user' || turn.role === 'model')
         ) {
-          contents.push({
-            role: turn.role,
-            parts: [{ text: turn.text.trim() }],
-          });
+          if (contents.length === 0 && turn.role !== 'user') {
+            continue;
+          }
+          const prev = contents[contents.length - 1];
+          if (prev && prev.role === turn.role) {
+            prev.parts[0].text += `\n${turn.text.trim()}`;
+          } else {
+            contents.push({
+              role: turn.role,
+              parts: [{ text: turn.text.trim() }],
+            });
+          }
         }
       }
     }
 
-    const contextString = JSON.stringify(publicContext || {}, null, 0);
+    const contextString = JSON.stringify(publicContext || {});
     const enrichedUserPrompt =
       `اطلاعات عمومی و به‌روز سامانه (بدون اطلاعات حساس):\n${contextString}\n\n` +
       `پرسش کاربر:\n${message.trim()}`;
 
-    contents.push({
-      role: 'user',
-      parts: [{ text: enrichedUserPrompt }],
-    });
+    if (contents.length > 0 && contents[contents.length - 1].role === 'user') {
+      contents[contents.length - 1].parts[0].text += `\n\n${enrichedUserPrompt}`;
+    } else {
+      contents.push({
+        role: 'user',
+        parts: [{ text: enrichedUserPrompt }],
+      });
+    }
 
     const geminiRequestBody = {
       system_instruction: {
@@ -295,13 +322,16 @@ app.post('/api/ai-chat', async (req, res) => {
       },
     };
 
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${encodeURIComponent(
-      apiKey
-    )}`;
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      geminiModel
+    )}:generateContent`;
 
     const aiResponse = await fetch(geminiUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey,
+      },
       body: JSON.stringify(geminiRequestBody),
     });
 
@@ -323,7 +353,7 @@ app.post('/api/ai-chat', async (req, res) => {
       .join('\n')
       .trim();
 
-    // استخراج منابع جستجوی زنده گوگل (groundingMetadata.groundingChunks)
+    // استخراج لینک منابع جستجوی گوگل
     const rawChunks = candidate?.groundingMetadata?.groundingChunks || [];
     const seenUris = new Set();
     const sources = [];
@@ -355,7 +385,7 @@ app.post('/api/ai-chat', async (req, res) => {
   }
 });
 
-// اجرای محلی برای تست در صورت اجرا با node server.js
+// اجرای محلی
 if (require.main === module) {
   const PORT = process.env.PORT || 3001;
   app.listen(PORT, () => {
@@ -363,5 +393,4 @@ if (require.main === module) {
   });
 }
 
-// خروجی الزامی برای Vercel Serverless
 module.exports = app;
