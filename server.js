@@ -5,290 +5,153 @@ const cors = require('cors');
 
 const app = express();
 
-// -------------------------------------------------------------
-// 1. تنظیمات CORS و افزایش محدودیت حجم برای تصاویر Base64
-// -------------------------------------------------------------
-const allowedOrigins = [
-  'https://eskan-isfcfu.vercel.app',
-  'http://localhost:3000',
-  'http://127.0.0.1:3000',
-];
+// 1. تنظیمات CORS پیش از اتصال به دیتابیس تا OPTIONS هیچ‌وقت 500 نشود
+const corsOptions = {
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
-app.use(
-  cors({
-    origin: function (origin, callback) {
-      // اجازه درخواست‌های بدون origin (مثل تست سرور/Postman) یا دامنه‌های مجاز
-      if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
-        callback(null, true);
-      } else {
-        callback(new Error('Not allowed by CORS'));
-      }
-    },
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true,
-  })
-);
-
-app.options('*', cors());
 app.use(express.json({ limit: '15mb' }));
-app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
-// -------------------------------------------------------------
-// 2. اتصال کش‌شده به MongoDB Atlas (بهینه برای محیط Serverless Vercel)
-// -------------------------------------------------------------
-let cached = global.mongooseCache;
+// 2. اتصال امن و کش‌شده به MongoDB برای محیط Serverless Vercel
+let cached = global._mongooseCache;
 if (!cached) {
-  cached = global.mongooseCache = { conn: null, promise: null };
+  cached = global._mongooseCache = { conn: null, promise: null };
 }
 
-async function connectToDatabase() {
-  if (cached.conn) {
-    return cached.conn;
-  }
+async function connectDB() {
+  if (cached.conn) return cached.conn;
 
-  const mongoUri = process.env.MONGODB_URI;
-  if (!mongoUri) {
-    throw new Error('متغیر محیطی MONGODB_URI تعریف نشده است.');
+  const uri = process.env.MONGODB_URI;
+  if (!uri) {
+    throw new Error('متغیر MONGODB_URI در تنظیمات محیطی Vercel تعریف نشده است.');
   }
 
   if (!cached.promise) {
     cached.promise = mongoose
-      .connect(mongoUri, {
-        bufferCommands: false,
-        maxPoolSize: 10,
-        serverSelectionTimeoutMS: 8000,
-      })
-      .then((mongooseInstance) => mongooseInstance);
+      .connect(uri, { bufferCommands: false, serverSelectionTimeoutMS: 8000 })
+      .then((m) => m);
   }
-
-  try {
-    cached.conn = await cached.promise;
-  } catch (err) {
-    cached.promise = null;
-    throw err;
-  }
-
+  cached.conn = await cached.promise;
   return cached.conn;
 }
 
-// میدل‌ور تضمین اتصال به دیتابیس پیش از اجرای مسیرهای API
-app.use('/api', async (req, res, next) => {
-  try {
-    await connectToDatabase();
-    next();
-  } catch (err) {
-    console.error('MongoDB connection error:', err);
-    res.status(500).json({
-      success: false,
-      message: 'خطا در اتصال به دیتابیس ابری MongoDB',
-      error: err.message,
-    });
-  }
-});
-
-// -------------------------------------------------------------
-// 3. تعریف مدل‌های Mongoose
-// -------------------------------------------------------------
-const STUDENTS_STORAGE_KEY = 'farhangian_dorm_students_prod';
+// 3. مدل‌های MongoDB
+const SyncDataSchema = new mongoose.Schema(
+  {
+    key: { type: String, required: true, unique: true, index: true },
+    value: { type: mongoose.Schema.Types.Mixed, required: true },
+  },
+  { timestamps: true }
+);
+const SyncData = mongoose.models.SyncData || mongoose.model('SyncData', SyncDataSchema);
 
 const StudentSchema = new mongoose.Schema(
   {
     studentId: { type: String, required: true, unique: true, index: true },
   },
-  {
-    strict: false,
-    timestamps: true,
-  }
+  { strict: false, timestamps: true }
 );
-
-const CloudStorageSchema = new mongoose.Schema(
-  {
-    key: { type: String, required: true, unique: true, index: true },
-    value: { type: mongoose.Schema.Types.Mixed, required: true },
-    updatedAt: { type: Date, default: Date.now },
-  },
-  {
-    minimize: false,
-  }
-);
-
 const Student = mongoose.models.Student || mongoose.model('Student', StudentSchema);
-const CloudStorage = mongoose.models.CloudStorage || mongoose.model('CloudStorage', CloudStorageSchema);
 
-// تابع کمکی همگام‌سازی کالکشن Student با کلید کش دانشجویان در CloudStorage
-async function mirrorStudentsToCloudStorage() {
-  const allStudents = await Student.find({}, { _id: 0, __v: 0, createdAt: 0, updatedAt: 0 }).lean();
-  await CloudStorage.findOneAndUpdate(
-    { key: STUDENTS_STORAGE_KEY },
-    { value: allStudents, updatedAt: new Date() },
-    { upsert: true, new: true }
-  );
-  return allStudents;
-}
+// 4. تست سلامت سرور
+app.get('/', (req, res) => {
+  res.json({
+    ok: true,
+    service: 'khabgah-api',
+    hasMongoUri: Boolean(process.env.MONGODB_URI),
+    dbReadyState: mongoose.connection.readyState,
+  });
+});
 
-// -------------------------------------------------------------
-// 4. مسیرهای همگام‌سازی سراسری (/api/sync)
-// -------------------------------------------------------------
+// 5. مسیر همگام‌سازی کلید-مقدار سراها، اتاق‌ها، تخت‌ها، دانشجویان و تنظیمات
 app.get('/api/sync', async (req, res) => {
   try {
-    const records = await CloudStorage.find({}).lean();
-    const payload = {};
-    for (const item of records) {
-      if (item && item.key) {
-        payload[item.key] = item.value;
-      }
+    await connectDB();
+    const docs = await SyncData.find({}).lean();
+    const result = {};
+    for (const doc of docs) {
+      result[doc.key] = doc.value;
     }
-    res.status(200).json(payload);
+    res.json(result);
   } catch (err) {
     console.error('GET /api/sync error:', err);
-    res.status(500).json({ success: false, message: 'خطا در دریافت اطلاعات از دیتابیس ابری' });
+    res.status(500).json({ message: err.message || 'خطا در دریافت اطلاعات از دیتابیس' });
   }
 });
 
 app.post('/api/sync', async (req, res) => {
   try {
-    const { key, value } = req.body;
-    if (!key || value === undefined) {
-      return res.status(400).json({ success: false, message: 'فیلدهای key و value الزامی هستند.' });
+    await connectDB();
+    const { key, value } = req.body || {};
+    if (!key) {
+      return res.status(400).json({ message: 'کلید همگام‌سازی ارسال نشده است.' });
     }
-
-    await CloudStorage.findOneAndUpdate(
+    await SyncData.findOneAndUpdate(
       { key },
-      { value, updatedAt: new Date() },
+      { $set: { value } },
       { upsert: true, new: true }
     );
-
-    // در صورت تغییر لیست کامل دانشجویان، کالکشن Student نیز به‌روزرسانی و همگام شود
-    if (key === STUDENTS_STORAGE_KEY && Array.isArray(value)) {
-      const validStudents = value.filter((s) => s && s.studentId);
-      const incomingIds = validStudents.map((s) => String(s.studentId));
-
-      if (validStudents.length > 0) {
-        const bulkOps = validStudents.map((st) => {
-          const cleanStudent = { ...st };
-          delete cleanStudent._id;
-          delete cleanStudent.__v;
-          return {
-            updateOne: {
-              filter: { studentId: String(st.studentId) },
-              update: { $set: cleanStudent },
-              upsert: true,
-            },
-          };
-        });
-        await Student.bulkWrite(bulkOps);
-      }
-
-      // حذف دانشجویانی که در لیست جدید وجود ندارند
-      await Student.deleteMany({ studentId: { $nin: incomingIds } });
-    }
-
-    res.status(200).json({ success: true, key, updatedAt: new Date() });
+    res.json({ success: true, key });
   } catch (err) {
     console.error('POST /api/sync error:', err);
-    res.status(500).json({ success: false, message: 'خطا در ذخیره‌سازی داده در دیتابیس ابری' });
+    res.status(500).json({ message: err.message || 'خطا در ذخیره‌سازی در دیتابیس' });
   }
 });
 
-// -------------------------------------------------------------
-// 5. مسیرهای اختصاصی مدیریت دانشجویان (/api/students)
-// -------------------------------------------------------------
+// 6. مسیرهای مستقیم دانشجویان
 app.get('/api/students', async (req, res) => {
   try {
-    const students = await Student.find({}, { _id: 0, __v: 0 }).lean();
-    res.status(200).json(students);
+    await connectDB();
+    const students = await Student.find({}).sort({ createdAt: -1 }).lean();
+    res.json(students);
   } catch (err) {
     console.error('GET /api/students error:', err);
-    res.status(500).json({ success: false, message: 'خطا در دریافت لیست دانشجویان' });
+    res.status(500).json({ message: err.message || 'خطا در دریافت لیست دانشجویان' });
   }
 });
 
 app.post('/api/students', async (req, res) => {
   try {
-    const studentData = { ...req.body };
-    if (!studentData.studentId) {
-      return res.status(400).json({ success: false, message: 'شماره دانشجویی (studentId) الزامی است.' });
+    await connectDB();
+    const data = req.body || {};
+    if (!data.studentId) {
+      return res.status(400).json({ message: 'شماره دانشجویی الزامی است.' });
     }
-
-    delete studentData._id;
-    delete studentData.__v;
-
-    const savedStudent = await Student.findOneAndUpdate(
-      { studentId: String(studentData.studentId) },
-      { $set: studentData },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    ).lean();
-
-    await mirrorStudentsToCloudStorage();
-
-    res.status(201).json({ success: true, student: savedStudent });
+    const exists = await Student.findOne({ studentId: String(data.studentId) }).lean();
+    if (exists) {
+      return res.status(409).json({ message: 'دانشجویی با این شماره دانشجویی قبلاً در دیتابیس ثبت شده است.' });
+    }
+    const created = await Student.create(data);
+    res.status(201).json({
+      success: true,
+      message: 'دانشجو با موفقیت در دیتابیس ابری ثبت شد.',
+      student: created.toObject(),
+    });
   } catch (err) {
     console.error('POST /api/students error:', err);
-    res.status(500).json({ success: false, message: 'خطا در ثبت دانشجو', error: err.message });
-  }
-});
-
-app.put('/api/students/:studentId', async (req, res) => {
-  try {
-    const { studentId } = req.params;
-    const updates = { ...req.body };
-    delete updates._id;
-    delete updates.__v;
-
-    const updatedStudent = await Student.findOneAndUpdate(
-      { studentId: String(studentId) },
-      { $set: updates },
-      { new: true }
-    ).lean();
-
-    if (!updatedStudent) {
-      return res.status(404).json({ success: false, message: 'دانشجو یافت نشد.' });
-    }
-
-    await mirrorStudentsToCloudStorage();
-
-    res.status(200).json({ success: true, student: updatedStudent });
-  } catch (err) {
-    console.error('PUT /api/students/:studentId error:', err);
-    res.status(500).json({ success: false, message: 'خطا در ویرایش اطلاعات دانشجو' });
+    res.status(500).json({ message: err.message || 'خطا در ثبت دانشجو در دیتابیس ابری' });
   }
 });
 
 app.delete('/api/students/:studentId', async (req, res) => {
   try {
-    const { studentId } = req.params;
-    const deleted = await Student.findOneAndDelete({ studentId: String(studentId) }).lean();
-
-    if (!deleted) {
-      return res.status(404).json({ success: false, message: 'دانشجو برای حذف یافت نشد.' });
-    }
-
-    await mirrorStudentsToCloudStorage();
-
-    res.status(200).json({ success: true, message: 'دانشجو با موفقیت حذف شد.' });
+    await connectDB();
+    await Student.deleteOne({ studentId: req.params.studentId });
+    res.json({ success: true });
   } catch (err) {
-    console.error('DELETE /api/students/:studentId error:', err);
-    res.status(500).json({ success: false, message: 'خطا در حذف دانشجو' });
+    console.error('DELETE /api/students error:', err);
+    res.status(500).json({ message: err.message || 'خطا در حذف دانشجو' });
   }
 });
 
-// مسیر سلامت سرور
-app.get(['/', '/api/health'], (req, res) => {
-  res.status(200).json({
-    status: 'ok',
-    service: 'khabgah-api',
-    database: 'MongoDB Atlas',
-    timestamp: new Date().toISOString(),
-  });
-});
-
-// سازگاری با اجرای محلی و Serverless Vercel
+// 7. اجرا فقط در محیط لوکال؛ در Vercel فقط app اکسپورت می‌شود
 if (require.main === module) {
   const PORT = process.env.PORT || 5000;
-  app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-  });
+  app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 }
 
 module.exports = app;
