@@ -226,79 +226,19 @@ app.delete('/api/students/:studentId', async (req, res) => {
 });
 
 // ============================================================================
-// کمک‌تابع خواندن خلاصه عمومی ایمن از دیتابیس (بدون اطلاعات حساس یا هویتی)
-// ============================================================================
-async function getSafeDbPublicSummary() {
-  try {
-    await connectToDatabase();
-    const docs = await SyncData.find({
-      key: {
-        $in: [
-          'farhangian_dorm_dormitories_prod',
-          'farhangian_dorm_announcements_prod',
-          'farhangian_dorm_settings_prod',
-        ],
-      },
-    }).lean();
-
-    const dbSummary = {};
-    for (const doc of docs) {
-      if (doc.key === 'farhangian_dorm_dormitories_prod' && Array.isArray(doc.value)) {
-        dbSummary.dormitories = doc.value.map((d) => ({
-          name: d?.name || '',
-          campus: d?.campus || '',
-          gender: d?.gender === 'brothers' ? 'برادران' : 'خواهران',
-          totalFloors: d?.totalFloors || 0,
-        }));
-      } else if (doc.key === 'farhangian_dorm_announcements_prod' && Array.isArray(doc.value)) {
-        dbSummary.announcements = doc.value
-          .filter((a) => a?.showOnHomePage !== false)
-          .slice(0, 10)
-          .map((a) => ({
-            title: a?.title || '',
-            content: a?.content || '',
-            date: a?.date || '',
-            priority: a?.priority || 'normal',
-          }));
-      } else if (doc.key === 'farhangian_dorm_settings_prod' && doc.value) {
-        // دقت: رمز عبور مدیر (adminPassword) به هیچ وجه استخراج نمی‌شود
-        dbSummary.settings = {
-          universityName: doc.value.universityName || '',
-          currentAcademicYear: doc.value.currentAcademicYear || '',
-          currentSemester: doc.value.currentSemester || '',
-          selectionActive: Boolean(doc.value.selectionActive),
-          selectionStartDate: doc.value.selectionStartDate || '',
-          selectionEndDate: doc.value.selectionEndDate || '',
-        };
-      }
-    }
-    return dbSummary;
-  } catch (err) {
-    console.warn('getSafeDbPublicSummary warning:', err.message);
-    return null;
-  }
-}
-
-// ============================================================================
-// مسیر دستیار هوشمند خوابگاهی و آموزشی با Groq API (llama-3.3-70b-versatile)
+// مسیر دستیار هوشمند خوابگاهی و آموزشی با انتخاب خودکار مدل فعال Groq
 // ============================================================================
 app.get('/api/ai-chat', (req, res) => {
   res.json({
     ok: true,
-    provider: 'Groq',
-    model: 'llama-3.3-70b-versatile',
+    provider: 'Groq (Auto Model Discovery)',
     message: 'برای گفتگو با دستیار هوشمند از متد POST استفاده کنید.',
   });
 });
 
 app.post('/api/ai-chat', async (req, res) => {
   try {
-    const { message, history = [], publicContext = {} } = req.body || {};
-
-    if (!message || typeof message !== 'string' || !message.trim()) {
-      return res.status(400).json({ error: 'متن پیام کاربر نمی‌تواند خالی باشد.' });
-    }
-
+    const { message, history = [], publicContext, studentInfo } = req.body || {};
     const apiKey = (
       process.env.GROQ_API_KEY ||
       process.env.GEMINI_API_KEY ||
@@ -307,99 +247,138 @@ app.post('/api/ai-chat', async (req, res) => {
 
     if (!apiKey) {
       return res.status(500).json({
-        error:
-          'کلید API هوش مصنوعی (GROQ_API_KEY یا GEMINI_API_KEY) در تنظیمات Environment Variables پروژه Vercel تعریف نشده است.',
+        error: 'کلید API در تنظیمات سرور (Vercel) یافت نشد.',
+        reply: 'کلید API در تنظیمات سرور (Vercel) یافت نشد.',
       });
     }
 
-    const hasClientContext =
-      publicContext &&
-      typeof publicContext === 'object' &&
-      Object.keys(publicContext).length > 0;
-    const dbFallbackSummary = hasClientContext
-      ? null
-      : await getSafeDbPublicSummary();
+    const effectiveUserContext =
+      studentInfo ||
+      (publicContext && publicContext.currentUserContext) ||
+      'کاربر مهمان';
 
-    const contextData = hasClientContext ? publicContext : dbFallbackSummary || {};
+    const systemInstruction = `
+تو دستیار هوشمند رسمی «سامانه اسکان و امور سراهای دانشجویی دانشگاه فرهنگیان اصفهان» هستی.
+به سوالات دانشجویان و کاربران درباره اطلاعات عمومی سراها، اطلاعیه‌ها، مسائل خوابگاهی، آموزشی، علمی و عمومی به زبان فارسی روان، دقیق و محترمانه پاسخ بده.
+خط قرمز امنیتی: تحت هیچ شرایطی اطلاعات شخصی و حساس دانشجویان و کاربران (کد ملی، شماره تماس، رمز عبور، آدرس، پرونده انضباطی و محل اسکان سایر افراد) را فاش نکن.
 
-    const systemPrompt = [
-      'تو دستیار هوشمند خوابگاهی و آموزشی «سامانه جامع سراهای دانشجویی دانشگاه فرهنگیان استان اصفهان» هستی.',
-      'وظیفه تو پاسخگویی دقیق، محترمانه و روان به زبان فارسی به سوالات دانشجویان، سرپرستان و مراجعان درباره امور سراها، اسکان، اتاق‌ها، ظرفیت‌ها، میانگین نمرات ارزیابی اتاق‌ها، اطلاعیه‌ها، برنامه حضور سرپرستان و مشاوران و همچنین سوالات عمومی آموزشی، علمی و خوابگاهی است.',
-      '',
-      'قوانین اکید امنیتی و حفظ حریم خصوصی (بسیار مهم):',
-      '۱. هرگز اطلاعات حساس و شخصی کاربران از جمله کد ملی، شماره موبایل، تلفن ثابت، شماره والدین/اضطراری، رمز عبور، نشانی منزل، پیام‌های خصوصی مشاوره و اخطارهای انضباطی را افشا نکن.',
-      '۲. هرگز نام یا محل اسکان سایر دانشجویان (اینکه چه کسی در کدام اتاق یا تخت ساکن است) را فاش نکن. در پاسخ به پرسش درباره اتاق‌ها فقط آمار ظرفیت کل، تعداد پر و خالی، امکانات، رشته‌های مجاز و میانگین ناشناس نمرات را ارائه بده.',
-      '۳. تنها در صورتی که در بخش currentUserContext اطلاعات خودِ دانشجوی لاگین‌شده موجود باشد، می‌توانی درباره وضعیت اسکان، اتاق، تخت و نمرات ارزیابیِ خودِ همان دانشجو پاسخ دهی.',
-      '۴. اگر داده‌ای در اطلاعات سامانه وجود ندارد، صادقانه بیان کن و از حدس زدن آمار نادرست خودداری کن.',
-      '',
-      `اطلاعات عمومی و مجاز سامانه:\n${JSON.stringify(contextData)}`,
-    ].join('\n');
+اطلاعات عمومی سامانه:
+${publicContext ? JSON.stringify(publicContext) : ''}
 
-    const messages = [{ role: 'system', content: systemPrompt }];
+اطلاعات کاربر فعلی:
+${typeof effectiveUserContext === 'string' ? effectiveUserContext : JSON.stringify(effectiveUserContext)}
+`;
 
-    // افزودن تاریخچه مکالمه قبلی با فرمت استاندارد OpenAI/Groq
+    // ۱. دریافت خودکار لیست مدل‌های فعال از اکانت Groq شما تا هرگز خطای نام مدل ندهد
+    let selectedModel = 'llama-3.1-8b-instant';
+    try {
+      const modelsRes = await fetch('https://api.groq.com/openai/v1/models', {
+        headers: { Authorization: `Bearer ${apiKey}` },
+      });
+      if (modelsRes.ok) {
+        const modelsData = await modelsRes.json();
+        const availableIds = (modelsData.data || []).map((m) => m.id);
+
+        // اولویت انتخاب بهترین مدل‌های متنی موجود در اکانت
+        const preferredModels = [
+          'meta-llama/llama-4-scout-17b-16e-instruct',
+          'meta-llama/llama-4-maverick-17b-128e-instruct',
+          'qwen-qwq-32b',
+          'deepseek-r1-distill-llama-70b',
+          'llama-3.3-70b-versatile',
+          'llama-3.3-70b-specdec',
+          'llama-3.1-8b-instant',
+          'gemma2-9b-it',
+        ];
+
+        const found = preferredModels.find((m) => availableIds.includes(m));
+        if (found) {
+          selectedModel = found;
+        } else {
+          // انتخاب اولین مدل چت موجود که مدل صوتی (whisper/tts) یا امنیتی (guard) نباشد
+          const fallback = availableIds.find(
+            (id) =>
+              !id.includes('whisper') &&
+              !id.includes('tts') &&
+              !id.includes('guard') &&
+              !id.includes('audio')
+          );
+          if (fallback) selectedModel = fallback;
+        }
+      }
+    } catch (e) {
+      console.error('Error fetching Groq models list:', e);
+    }
+
+    // آماده‌سازی پیام‌ها شامل تاریخچه مکالمه قبلی + پیام فعلی کاربر
+    const chatMessages = [{ role: 'system', content: systemInstruction }];
+
     if (Array.isArray(history)) {
       for (const turn of history.slice(-8)) {
         if (turn && typeof turn.text === 'string' && turn.text.trim()) {
-          messages.push({
-            role: turn.role === 'model' || turn.role === 'assistant' ? 'assistant' : 'user',
+          chatMessages.push({
+            role:
+              turn.role === 'model' || turn.role === 'assistant'
+                ? 'assistant'
+                : 'user',
             content: turn.text.trim(),
           });
         }
       }
     }
 
-    messages.push({
+    chatMessages.push({
       role: 'user',
-      content: message.trim(),
+      content:
+        typeof message === 'string' && message.trim() ? message.trim() : 'سلام',
     });
 
-    const groqResponse = await fetch(
+    // ۲. ارسال پیام کاربر به مدل فعال انتخاب‌شده
+    const response = await fetch(
       'https://api.groq.com/openai/v1/chat/completions',
       {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: 'Bearer ' + apiKey,
+          Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
-          messages,
+          model: selectedModel,
+          messages: chatMessages,
           temperature: 0.5,
           max_tokens: 1024,
         }),
       }
     );
 
-    const data = await groqResponse.json().catch(() => ({}));
+    const data = await response.json().catch(() => ({}));
 
-    if (!groqResponse.ok) {
-      console.error('Groq API Error:', groqResponse.status, data);
-      return res.status(groqResponse.status || 502).json({
-        error:
-          data?.error?.message ||
-          'خطا در دریافت پاسخ از سرویس هوش مصنوعی Groq.',
+    if (!response.ok) {
+      console.error('Groq API Error:', data);
+      const errMsg = `خطای سرویس هوش مصنوعی (${selectedModel}): ${
+        data?.error?.message || 'خطای نامشخص'
+      }`;
+      return res.status(response.status).json({
+        error: errMsg,
+        reply: errMsg,
       });
     }
 
-    const reply =
-      data?.choices?.[0]?.message?.content?.trim() ||
-      'متأسفانه پاسخی از دستیار هوشمند دریافت نشد. لطفاً دوباره تلاش کنید.';
+    // پاک کردن تگ‌های فکر کردن احتمالی در مدل‌های استدلالی
+    let reply = data?.choices?.[0]?.message?.content || 'پاسخی دریافت نشد.';
+    reply = reply.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
 
-    return res.json({
-      success: true,
-      reply,
-    });
+    return res.json({ success: true, reply, modelUsed: selectedModel });
   } catch (error) {
-    console.error('POST /api/ai-chat error:', error);
+    console.error('AI Chat Server Error:', error);
     return res.status(500).json({
-      error: 'خطای داخلی سرور هنگام پردازش گفتگو با دستیار هوشمند.',
-      details: error.message,
+      error: 'خطا در ارتباط سرور با هوش مصنوعی.',
+      reply: 'خطا در ارتباط سرور با هوش مصنوعی.',
     });
   }
 });
 
-// اجرای محلی برای تست
+// اجرای محلی
 if (require.main === module) {
   const PORT = process.env.PORT || 3001;
   app.listen(PORT, () => {
