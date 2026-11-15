@@ -4,428 +4,447 @@ const cors = require('cors');
 
 const app = express();
 
-// تنظیمات CORS و محدودیت حجم بدنه
+// تنظیم CORS برای دسترسی فرانت‌اند از همه دامنه‌ها
 app.use(
   cors({
     origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
   })
 );
-app.use(express.json({ limit: '25mb' }));
-app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
-// ============================================================================
-// اتصال کش‌شده به MongoDB Atlas (فقط از متغیر محیطی Vercel خوانده می‌شود)
-// ============================================================================
-const MONGODB_URI =
-  process.env.MONGODB_URI || process.env.MONGO_URI || process.env.DATABASE_URL;
+// سقف امن زیر محدودیت ۴.۵ مگابایتی Vercel Serverless
+app.use(express.json({ limit: '4mb' }));
 
-let cached = global.__mongooseCache;
-if (!cached) {
-  cached = global.__mongooseCache = { conn: null, promise: null };
-}
+// ==========================================
+// اتصال پایدار و کش‌شده به MongoDB Atlas (مناسب Vercel Serverless)
+// ==========================================
+let cachedConn = null;
+let connPromise = null;
 
-async function connectToDatabase() {
-  if (cached.conn) {
-    return cached.conn;
+async function connectDB() {
+  if (cachedConn && mongoose.connection.readyState === 1) {
+    return cachedConn;
   }
-  if (!MONGODB_URI) {
-    throw new Error('متغیر محیطی MONGODB_URI در تنظیمات Vercel تعریف نشده است.');
+
+  const uri = process.env.MONGODB_URI || process.env.MONGO_URL;
+  if (!uri) {
+    throw new Error('MONGODB_URI environment variable is not defined.');
   }
-  if (!cached.promise) {
-    cached.promise = mongoose
-      .connect(MONGODB_URI, {
-        bufferCommands: false,
-        serverSelectionTimeoutMS: 8000,
+
+  if (!connPromise) {
+    connPromise = mongoose
+      .connect(uri, {
+        serverSelectionTimeoutMS: 10000,
+        socketTimeoutMS: 20000,
       })
-      .then((m) => m);
+      .then((m) => {
+        cachedConn = m;
+        return m;
+      })
+      .catch((err) => {
+        connPromise = null;
+        throw err;
+      });
   }
-  cached.conn = await cached.promise;
-  return cached.conn;
+
+  return connPromise;
 }
 
-// ============================================================================
-// مدل‌های دیتابیس MongoDB
-// ============================================================================
-const syncDataSchema = new mongoose.Schema(
+// ==========================================
+// مدل‌های Mongoose
+// ==========================================
+const SyncItemSchema = new mongoose.Schema(
   {
     key: { type: String, required: true, unique: true, index: true },
-    value: { type: mongoose.Schema.Types.Mixed, default: null },
+    value: { type: mongoose.Schema.Types.Mixed, required: true },
   },
-  { timestamps: true, strict: false }
+  { timestamps: true }
 );
 
-const studentSchema = new mongoose.Schema(
+const StudentSchema = new mongoose.Schema(
   {
     studentId: { type: String, required: true, unique: true, index: true },
-    nationalId: { type: String, default: '' },
-    fullName: { type: String, default: '' },
+    nationalId: { type: String, required: true },
+    fullName: { type: String, required: true },
   },
-  { timestamps: true, strict: false }
+  { strict: false, timestamps: true }
 );
 
-const SyncData =
-  mongoose.models.SyncData || mongoose.model('SyncData', syncDataSchema);
-const StudentModel =
-  mongoose.models.Student || mongoose.model('Student', studentSchema);
+const UserPhotoSchema = new mongoose.Schema(
+  {
+    role: {
+      type: String,
+      required: true,
+      enum: ['student', 'supervisor', 'maintenance', 'warehouse', 'counselor'],
+    },
+    userId: { type: String, required: true },
+    contentType: { type: String, default: 'image/jpeg' },
+    dataUrl: { type: String, required: true },
+    updatedAt: { type: Date, default: Date.now },
+  },
+  { timestamps: true }
+);
 
-// ============================================================================
-// مسیر بررسی سلامت سرور
-// ============================================================================
+UserPhotoSchema.index({ role: 1, userId: 1 }, { unique: true });
+
+const SyncItem = mongoose.models.SyncItem || mongoose.model('SyncItem', SyncItemSchema);
+const Student = mongoose.models.Student || mongoose.model('Student', StudentSchema);
+const UserPhoto = mongoose.models.UserPhoto || mongoose.model('UserPhoto', UserPhotoSchema);
+
+// تابع کمکی ساخت آدرس پایه سرور
+function getBaseUrl(req) {
+  const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+  const host = req.get('host');
+  return `${proto}://${host}`;
+}
+
+// ==========================================
+// مسیر بررسی سلامت سرویس
+// ==========================================
 app.get('/', (req, res) => {
   res.json({
     ok: true,
     service: 'khabgah-api',
-    message: 'سرور ابری سامانه جامع سراهای دانشجویی فعال است.',
-    endpoints: ['/api/sync', '/api/students', '/api/ai-chat'],
+    timestamp: new Date().toISOString(),
+    endpoints: [
+      '/api/sync',
+      '/api/students',
+      '/api/photos/batch',
+      '/api/photo/:role/:userId',
+      '/api/photos/manifest',
+      '/api/ai-chat',
+    ],
   });
 });
 
-// ============================================================================
-// مسیرهای همگام‌سازی سراسری سامانه (/api/sync)
-// ============================================================================
+// ==========================================
+// 1. مسیرهای همگام‌سازی کلید-مقدار (/api/sync)
+// ==========================================
 app.get('/api/sync', async (req, res) => {
   try {
-    await connectToDatabase();
-    const docs = await SyncData.find({}).lean();
+    await connectDB();
+    const items = await SyncItem.find({}).lean();
     const result = {};
-    for (const doc of docs) {
-      if (doc && doc.key) {
-        result[doc.key] = doc.value;
-      }
+    for (const item of items) {
+      result[item.key] = item.value;
     }
-    return res.json(result);
-  } catch (error) {
-    console.error('GET /api/sync error:', error);
-    return res.status(500).json({
-      message: 'خطا در دریافت داده‌های همگام‌سازی از MongoDB Atlas',
-      error: error.message,
-    });
+    res.json(result);
+  } catch (err) {
+    console.error('GET /api/sync error:', err);
+    res.status(500).json({ ok: false, message: 'خطا در دریافت اطلاعات از دیتابیس ابری' });
   }
 });
 
 app.post('/api/sync', async (req, res) => {
   try {
-    await connectToDatabase();
     const { key, value } = req.body || {};
-    if (!key || typeof key !== 'string') {
-      return res.status(400).json({ message: 'کلید همگام‌سازی (key) معتبر نیست.' });
+    if (!key || typeof key !== 'string' || value === undefined) {
+      return res.status(400).json({ ok: false, message: 'کلید و مقدار معتبر الزامی است.' });
     }
-
-    await SyncData.findOneAndUpdate(
+    await connectDB();
+    await SyncItem.findOneAndUpdate(
       { key },
-      { $set: { key, value } },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
+      { $set: { value } },
+      { upsert: true, new: true }
     );
-
-    return res.json({ success: true, key });
-  } catch (error) {
-    console.error('POST /api/sync error:', error);
-    return res.status(500).json({
-      message: 'خطا در ذخیره‌سازی داده در MongoDB Atlas',
-      error: error.message,
-    });
+    res.json({ ok: true, key });
+  } catch (err) {
+    console.error('POST /api/sync error:', err);
+    res.status(500).json({ ok: false, message: 'خطا در ذخیره‌سازی همگام‌سازی ابری' });
   }
 });
 
-// ============================================================================
-// مسیرهای مدیریت دانشجویان (/api/students)
-// ============================================================================
+// ==========================================
+// 2. مسیرهای دانشجویان (/api/students)
+// ==========================================
 app.get('/api/students', async (req, res) => {
   try {
-    await connectToDatabase();
-    const students = await StudentModel.find({}).sort({ createdAt: -1 }).lean();
-    return res.json(students);
-  } catch (error) {
-    console.error('GET /api/students error:', error);
-    return res.status(500).json({
-      message: 'خطا در دریافت لیست دانشجویان از دیتابیس ابری',
-      error: error.message,
-    });
+    await connectDB();
+    const students = await Student.find({}).lean();
+    res.json(students);
+  } catch (err) {
+    console.error('GET /api/students error:', err);
+    res.status(500).json({ ok: false, message: 'خطا در دریافت لیست دانشجویان' });
   }
 });
 
 app.post('/api/students', async (req, res) => {
   try {
-    await connectToDatabase();
     const payload = req.body || {};
-    if (!payload.studentId) {
-      return res.status(400).json({ message: 'شماره دانشجویی الزامی است.' });
-    }
-
-    const existing = await StudentModel.findOne({
-      studentId: String(payload.studentId),
-    }).lean();
-    if (existing) {
-      return res.status(409).json({
-        message: 'دانشجویی با این شماره دانشجویی قبلاً در دیتابیس ابری ثبت شده است.',
+    if (!payload.studentId || !payload.nationalId || !payload.fullName) {
+      return res.status(400).json({
+        ok: false,
+        message: 'شماره دانشجویی، کد ملی و نام و نام خانوادگی الزامی است.',
       });
     }
 
-    const created = await StudentModel.create({
-      ...payload,
-      studentId: String(payload.studentId),
-    });
-
-    return res.status(201).json({
-      message: 'دانشجو با موفقیت در دیتابیس ابری ثبت شد.',
-      student: created.toObject(),
-    });
-  } catch (error) {
-    console.error('POST /api/students error:', error);
-    return res.status(500).json({
-      message: 'خطا در ثبت دانشجو در دیتابیس ابری',
-      error: error.message,
-    });
-  }
-});
-
-app.put('/api/students/:studentId', async (req, res) => {
-  try {
-    await connectToDatabase();
-    const { studentId } = req.params;
-    const updated = await StudentModel.findOneAndUpdate(
-      { studentId: String(studentId) },
-      { $set: req.body || {} },
-      { new: true }
-    ).lean();
-
-    if (!updated) {
-      return res.status(404).json({ message: 'دانشجوی موردنظر یافت نشد.' });
+    await connectDB();
+    const existing = await Student.findOne({ studentId: String(payload.studentId).trim() }).lean();
+    if (existing) {
+      return res.status(409).json({
+        ok: false,
+        message: 'دانشجویی با این شماره دانشجویی قبلاً در دیتابیس ثبت شده است.',
+      });
     }
-    return res.json({
-      message: 'اطلاعات دانشجو به‌روزرسانی شد.',
-      student: updated,
+
+    const created = await Student.create({
+      ...payload,
+      studentId: String(payload.studentId).trim(),
+      nationalId: String(payload.nationalId).trim(),
+      fullName: String(payload.fullName).trim(),
     });
-  } catch (error) {
-    console.error('PUT /api/students/:studentId error:', error);
-    return res.status(500).json({
-      message: 'خطا در ویرایش اطلاعات دانشجو',
-      error: error.message,
+
+    res.status(201).json({
+      ok: true,
+      student: created.toObject(),
+      message: 'دانشجو با موفقیت در دیتابیس ابری ثبت شد.',
     });
+  } catch (err) {
+    console.error('POST /api/students error:', err);
+    res.status(500).json({ ok: false, message: 'خطا در ثبت دانشجو در دیتابیس ابری' });
   }
 });
 
-app.delete('/api/students/:studentId', async (req, res) => {
+// ==========================================
+// 3. مسیرهای اختصاصی ذخیره و نمایش ابری تصاویر کاربران
+// ==========================================
+const ALLOWED_PHOTO_ROLES = new Set([
+  'student',
+  'supervisor',
+  'maintenance',
+  'warehouse',
+  'counselor',
+]);
+
+app.post('/api/photos/batch', async (req, res) => {
   try {
-    await connectToDatabase();
-    const { studentId } = req.params;
-    await StudentModel.deleteOne({ studentId: String(studentId) });
-    return res.json({
-      success: true,
-      message: 'دانشجو از دیتابیس ابری حذف شد.',
+    const { items } = req.body || {};
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ ok: false, message: 'آرایه تصاویر خالی است.' });
+    }
+
+    await connectDB();
+
+    const now = new Date();
+    const version = now.getTime();
+    const baseUrl = getBaseUrl(req);
+    const ops = [];
+    const urls = {};
+
+    for (const rawItem of items) {
+      if (!rawItem || typeof rawItem !== 'object') continue;
+      const role = String(rawItem.role || '').trim();
+      const userId = String(rawItem.userId || '').trim();
+      const dataUrl = String(rawItem.dataUrl || '').trim();
+
+      if (!ALLOWED_PHOTO_ROLES.has(role) || !userId) continue;
+      if (!dataUrl.startsWith('data:image/')) continue;
+
+      const mimeMatch = dataUrl.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,/);
+      const contentType = mimeMatch ? mimeMatch[1] : 'image/jpeg';
+
+      ops.push({
+        updateOne: {
+          filter: { role, userId },
+          update: {
+            $set: {
+              role,
+              userId,
+              contentType,
+              dataUrl,
+              updatedAt: now,
+            },
+          },
+          upsert: true,
+        },
+      });
+
+      urls[userId] = `${baseUrl}/api/photo/${encodeURIComponent(role)}/${encodeURIComponent(
+        userId
+      )}?v=${version}`;
+    }
+
+    if (ops.length === 0) {
+      return res.status(400).json({ ok: false, message: 'هیچ تصویر معتبری برای ذخیره یافت نشد.' });
+    }
+
+    await UserPhoto.bulkWrite(ops, { ordered: false });
+
+    res.json({
+      ok: true,
+      count: ops.length,
+      urls,
     });
-  } catch (error) {
-    console.error('DELETE /api/students/:studentId error:', error);
-    return res.status(500).json({
-      message: 'خطا در حذف دانشجو از دیتابیس ابری',
-      error: error.message,
-    });
+  } catch (err) {
+    console.error('POST /api/photos/batch error:', err);
+    res.status(500).json({ ok: false, message: 'خطا در ذخیره‌سازی ابری تصاویر در MongoDB' });
   }
 });
 
-// ============================================================================
-// مسیر دستیار هوشمند خوابگاهی و آموزشی با انتخاب خودکار و چرخشی مدل‌های Groq
-// ============================================================================
-app.get('/api/ai-chat', (req, res) => {
-  res.json({
-    ok: true,
-    provider: 'Groq (Auto Model Fallback)',
-    message: 'برای گفتگو با دستیار هوشمند از متد POST استفاده کنید.',
-  });
+app.get('/api/photo/:role/:userId', async (req, res) => {
+  try {
+    const role = String(req.params.role || '').trim();
+    const userId = String(req.params.userId || '').trim();
+
+    if (!ALLOWED_PHOTO_ROLES.has(role) || !userId) {
+      return res.status(400).send('Invalid photo parameters');
+    }
+
+    await connectDB();
+    const doc = await UserPhoto.findOne({ role, userId }).lean();
+    if (!doc || !doc.dataUrl) {
+      return res.status(404).send('Photo not found');
+    }
+
+    const match = String(doc.dataUrl).match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,(.+)$/);
+    if (!match) {
+      return res.status(500).send('Invalid stored image format');
+    }
+
+    const contentType = doc.contentType || match[1] || 'image/jpeg';
+    const imgBuffer = Buffer.from(match[2], 'base64');
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.send(imgBuffer);
+  } catch (err) {
+    console.error('GET /api/photo error:', err);
+    res.status(500).send('Error serving photo');
+  }
 });
+
+app.delete('/api/photo/:role/:userId', async (req, res) => {
+  try {
+    const role = String(req.params.role || '').trim();
+    const userId = String(req.params.userId || '').trim();
+    if (!ALLOWED_PHOTO_ROLES.has(role) || !userId) {
+      return res.status(400).json({ ok: false, message: 'پارامتر نامعتبر است.' });
+    }
+    await connectDB();
+    await UserPhoto.deleteOne({ role, userId });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('DELETE /api/photo error:', err);
+    res.status(500).json({ ok: false, message: 'خطا در حذف تصویر' });
+  }
+});
+
+app.get('/api/photos/manifest', async (req, res) => {
+  try {
+    await connectDB();
+    const list = await UserPhoto.find({}, { role: 1, userId: 1, updatedAt: 1, _id: 0 }).lean();
+    res.json({ ok: true, count: list.length, items: list });
+  } catch (err) {
+    console.error('GET /api/photos/manifest error:', err);
+    res.status(500).json({ ok: false, message: 'خطا در دریافت فهرست تصاویر' });
+  }
+});
+
+// ==========================================
+// 4. مسیر دستیار هوشمند سراها (/api/ai-chat با Groq)
+// ==========================================
+function cleanAndTruncate(text, maxChars = 1100) {
+  if (!text) return '';
+  const normalized = String(text)
+    .replace(/\r\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  if (normalized.length <= maxChars) return normalized;
+  return normalized.slice(0, maxChars).trim() + '...';
+}
 
 app.post('/api/ai-chat', async (req, res) => {
   try {
-    const { message, history = [], publicContext, studentInfo } = req.body || {};
-    const apiKey = (
-      process.env.GROQ_API_KEY ||
-      process.env.GEMINI_API_KEY ||
-      ''
-    ).trim();
-
+    const apiKey = process.env.GROQ_API_KEY || process.env.GEMINI_API_KEY;
     if (!apiKey) {
       return res.status(500).json({
-        error: 'کلید API در تنظیمات سرور (Vercel) یافت نشد.',
-        reply: 'کلید API در تنظیمات سرور (Vercel) یافت نشد.',
+        error: 'کلید GROQ_API_KEY در تنظیمات Vercel تعریف نشده است.',
       });
     }
 
-    // تابع کمکی برای حذف رشته‌های Base64 و محدود کردن ایمن طول هر بخش
-    const cleanAndTruncate = (obj, maxLength = 2500) => {
-      if (!obj) return '';
-      try {
-        const str = JSON.stringify(obj, (key, value) => {
-          if (
-            typeof value === 'string' &&
-            (value.startsWith('data:image') || value.length > 500)
-          ) {
-            return '[حذف شده برای کاهش حجم]';
-          }
-          return value;
-        });
-        return str.length > maxLength
-          ? str.substring(0, maxLength) + '... [خلاصه شده]'
-          : str;
-      } catch (e) {
-        return '';
-      }
-    };
+    const { message, history = [], publicContext = {} } = req.body || {};
+    if (!message || typeof message !== 'string') {
+      return res.status(400).json({ error: 'متن پیام معتبر نیست.' });
+    }
 
-    const ctx = publicContext && typeof publicContext === 'object' ? publicContext : {};
-    const effectiveStudentInfo = studentInfo || ctx.currentUserContext || 'کاربر مهمان';
-
-    // خلاصه‌سازی مجزا برای هر بخش تا اطلاعات حیاتی (مثل اطلاعیه‌ها و کاربر فعلی) قطع نشوند
-    const safeAcademicAndStats = cleanAndTruncate(
-      {
-        academicInfo: ctx.academicInfo,
-        overallStats: ctx.overallStats,
-        dormsSummary: ctx.dormsSummary,
-      },
-      1400
-    );
-    const safeRooms = cleanAndTruncate(ctx.roomsSummary, 2400);
-    const safeAnnouncements = cleanAndTruncate(ctx.publicAnnouncements, 1200);
-    const safeShifts = cleanAndTruncate(
-      {
-        supervisorShifts: ctx.supervisorShiftsSummary,
-        counselorShifts: ctx.counselorShiftsSummary,
-      },
-      1200
-    );
-    const safeStudent = cleanAndTruncate(effectiveStudentInfo, 900);
-    const safeMessage = String(message || 'سلام').substring(0, 1000);
-
-    const systemInstruction = `
-تو دستیار هوشمند رسمی «سامانه اسکان و امور سراهای دانشجویی دانشگاه فرهنگیان اصفهان» هستی.
-به سوالات دانشجویان درباره اطلاعات سراها، ظرفیت اتاق‌ها، میانگین نمرات اتاق‌ها، اطلاعیه‌ها، برنامه حضور سرپرستان و مشاوران و مسائل خوابگاهی و آموزشی به زبان فارسی روان و محترمانه پاسخ بده.
-خط قرمز امنیتی: هرگز اطلاعات شخصی و حساس (کد ملی، شماره تماس، رمز عبور، آدرس و نام یا محل اسکان سایر افراد) را فاش نکن.
-
-اطلاعات کلی و سراها:
-${safeAcademicAndStats}
-
-وضعیت اتاق‌ها (بدون اسامی ساکنین):
-${safeRooms}
-
-اطلاعیه‌های عمومی:
-${safeAnnouncements}
-
-برنامه شیفت سرپرستان و مشاوران:
-${safeShifts}
-
-اطلاعات کاربر فعلی:
-${safeStudent || 'کاربر مهمان'}
-`.trim();
-
-    // دریافت لیست مدل‌های فعال اکانت شما در Groq
-    let candidateModels = [
-      'meta-llama/llama-4-scout-17b-16e-instruct',
-      'meta-llama/llama-4-maverick-17b-128e-instruct',
-      'llama-3.3-70b-versatile',
-      'llama-3.1-8b-instant',
-      'qwen/qwen3-32b',
-      'qwen-qwq-32b',
-      'gemma2-9b-it',
-    ];
-
+    // انتخاب مدل فعال Groq به‌صورت پویا
+    let modelId = 'llama-3.3-70b-versatile';
     try {
       const modelsRes = await fetch('https://api.groq.com/openai/v1/models', {
         headers: { Authorization: `Bearer ${apiKey}` },
       });
       if (modelsRes.ok) {
         const modelsData = await modelsRes.json();
-        const availableIds = (modelsData.data || [])
-          .map((m) => m.id)
-          // حذف مدل‌های صوتی، امنیتی، تصویری و مدل کم‌حافظه allam
-          .filter(
-            (id) =>
-              !id.includes('whisper') &&
-              !id.includes('tts') &&
-              !id.includes('guard') &&
-              !id.includes('allam') &&
-              !id.includes('vision') &&
-              !id.includes('audio') &&
-              !id.includes('orpheus')
-          );
-
-        const prioritized = candidateModels.filter((m) =>
-          availableIds.includes(m)
-        );
-        const others = availableIds.filter((m) => !prioritized.includes(m));
-        if (prioritized.length > 0 || others.length > 0) {
-          candidateModels = [...prioritized, ...others];
-        }
+        const available = Array.isArray(modelsData?.data) ? modelsData.data.map((m) => m.id) : [];
+        const preferred = [
+          'llama-3.3-70b-versatile',
+          'llama-3.1-8b-instant',
+          'openai/gpt-oss-120b',
+          'gemma2-9b-it',
+        ];
+        const found = preferred.find((p) => available.includes(p));
+        if (found) modelId = found;
+        else if (available.length > 0) modelId = available[0];
       }
-    } catch (e) {
-      console.error('Error fetching models:', e);
+    } catch {
+      // استفاده از مدل پیش‌فرض
     }
 
-    // افزودن حداکثر ۴ پیام اخیر تاریخچه مکالمه برای حفظ جریان گفتگو بدون افزایش بیش از حد توکن
-    const chatMessages = [{ role: 'system', content: systemInstruction }];
+    const systemPrompt =
+      'شما دستیار هوشمند رسمی «سامانه جامع سراهای دانشجویی دانشگاه فرهنگیان استان اصفهان» هستید. ' +
+      'پاسخ‌ها را با لحن محترمانه، دقیق، کوتاه و فقط به زبان فارسی بنویسید. ' +
+      `اطلاعات عمومی فعلی سامانه: ${JSON.stringify(publicContext).slice(0, 2000)}`;
+
+    const chatMessages = [{ role: 'system', content: systemPrompt }];
     if (Array.isArray(history)) {
-      for (const turn of history.slice(-4)) {
-        if (turn && typeof turn.text === 'string' && turn.text.trim()) {
-          chatMessages.push({
-            role:
-              turn.role === 'model' || turn.role === 'assistant'
-                ? 'assistant'
-                : 'user',
-            content: turn.text.trim().substring(0, 450),
-          });
-        }
+      for (const h of history.slice(-8)) {
+        if (!h || typeof h.text !== 'string') continue;
+        chatMessages.push({
+          role: h.role === 'model' || h.role === 'assistant' ? 'assistant' : 'user',
+          content: h.text.slice(0, 1500),
+        });
       }
     }
-    chatMessages.push({ role: 'user', content: safeMessage });
+    chatMessages.push({ role: 'user', content: message.slice(0, 2000) });
 
-    // تست چرخشی مدل‌ها تا اولین مدلی که بدون خطا جواب می‌دهد
-    let lastError = 'مدلی یافت نشد';
-    for (const modelName of candidateModels.slice(0, 5)) {
-      const response = await fetch(
-        'https://api.groq.com/openai/v1/chat/completions',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify({
-            model: modelName,
-            messages: chatMessages,
-            temperature: 0.5,
-            max_tokens: 768,
-          }),
-        }
-      );
-
-      const data = await response.json().catch(() => ({}));
-
-      if (response.ok && data?.choices?.[0]?.message?.content) {
-        let reply = data.choices[0].message.content;
-        reply = reply.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-        return res.json({ success: true, reply, modelUsed: modelName });
-      } else {
-        lastError = `(${modelName}): ${data?.error?.message || 'خطا'}`;
-        console.warn('Model failed, trying next:', lastError);
-      }
-    }
-
-    const errMsg = `خطای سرویس هوش مصنوعی ${lastError}`;
-    return res.status(400).json({ error: errMsg, reply: errMsg });
-  } catch (error) {
-    console.error('AI Chat Server Error:', error);
-    return res.status(500).json({
-      error: 'خطا در ارتباط سرور با هوش مصنوعی.',
-      reply: 'خطا در ارتباط سرور با هوش مصنوعی.',
+    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: modelId,
+        messages: chatMessages,
+        temperature: 0.5,
+        max_tokens: 700,
+      }),
     });
+
+    const groqData = await groqRes.json().catch(() => ({}));
+    if (!groqRes.ok) {
+      return res.status(502).json({
+        error: groqData?.error?.message || 'خطا در ارتباط با سرویس هوش مصنوعی Groq',
+      });
+    }
+
+    const rawReply = groqData?.choices?.[0]?.message?.content || '';
+    res.json({
+      reply: cleanAndTruncate(rawReply),
+      sources: [],
+    });
+  } catch (err) {
+    console.error('POST /api/ai-chat error:', err);
+    res.status(500).json({ error: 'خطای داخلی سرور در پردازش پیام دستیار هوشمند' });
   }
 });
 
-// اجرای محلی
+// اجرای محلی (در Vercel از export استفاده می‌شود)
 if (require.main === module) {
-  const PORT = process.env.PORT || 3001;
-  app.listen(PORT, () => {
-    console.log(`khabgah-api running on port ${PORT}`);
+  const port = process.env.PORT || 3001;
+  app.listen(port, () => {
+    console.log(`khabgah-api running on port ${port}`);
   });
 }
 
