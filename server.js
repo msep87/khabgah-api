@@ -88,7 +88,7 @@ const ALLOWED_PHOTO_ROLES = new Set([
   'vice_dean',
 ]);
 
-const MAX_PHOTO_BYTES = 2 * 1024 * 1024;
+const MAX_PHOTO_BYTES = 2 * 1024 * 1024; // 2MB per avatar/photo
 const DISALLOWED_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 function sanitizePayload(value, depth = 0) {
@@ -162,6 +162,7 @@ if (compression) {
 
 app.use(express.json({ limit: '5mb' }));
 
+// Sliding-window in-memory rate limiter (bounded Map, ignores OPTIONS preflight)
 const rateBuckets = new Map();
 function createRateLimiter({ windowMs, maxRequests, keyPrefix }) {
   return (req, res, next) => {
@@ -196,8 +197,8 @@ function createRateLimiter({ windowMs, maxRequests, keyPrefix }) {
   };
 }
 
-const readLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 300, keyPrefix: 'r' });
-const writeLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 150, keyPrefix: 'w' });
+const readLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 500, keyPrefix: 'r' });
+const writeLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 500, keyPrefix: 'w' });
 const aiLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 25, keyPrefix: 'ai' });
 
 function requireSyncTokenIfConfigured(req, res, next) {
@@ -228,7 +229,8 @@ function extractDbNameFromUri(uri) {
     if (!uri) return '';
     const cleaned = uri.replace(/^mongodb(\+srv)?:\/\//i, 'https://');
     const parsed = new URL(cleaned);
-    return decodeURIComponent(parsed.pathname || '').replace(/^\/+|\/+$/g, '');
+    const dbPart = decodeURIComponent(parsed.pathname || '').replace(/^\/+|\/+$/g, '');
+    return dbPart;
   } catch {
     return '';
   }
@@ -285,9 +287,9 @@ async function getDb() {
       maxPoolSize: 5,
       minPoolSize: 0,
       maxIdleTimeMS: 30_000,
-      connectTimeoutMS: 10_000,
-      serverSelectionTimeoutMS: 10_000,
-      socketTimeoutMS: 20_000,
+      connectTimeoutMS: 12_000,
+      serverSelectionTimeoutMS: 12_000,
+      socketTimeoutMS: 45_000,
     });
     globalThis._khabgahMongoPromise = client.connect().catch((err) => {
       globalThis._khabgahMongoPromise = null;
@@ -352,11 +354,21 @@ function makeWeakEtag(raw) {
 // Root, Health & Version Endpoints
 // ============================================================================
 app.get('/', (_req, res) => {
-  res.json({ ok: true, service: 'khabgah-api', status: 'running', health: '/api/health' });
+  res.json({
+    ok: true,
+    service: 'khabgah-api',
+    status: 'running',
+    health: '/api/health',
+  });
 });
 
 app.get('/api', (_req, res) => {
-  res.json({ ok: true, service: 'khabgah-api', status: 'running', health: '/api/health' });
+  res.json({
+    ok: true,
+    service: 'khabgah-api',
+    status: 'running',
+    health: '/api/health',
+  });
 });
 
 app.get('/api/health', readLimiter, async (_req, res) => {
@@ -402,16 +414,74 @@ app.get('/api/sync/version', readLimiter, async (_req, res) => {
 });
 
 // ============================================================================
-// Sync Endpoints (GET, POST single, POST batch)
+// Sync Endpoints (Manifest, Chunked GET ?keys=, Full GET, POST single/batch)
 // ============================================================================
-app.get('/api/sync', readLimiter, async (req, res) => {
+app.get('/api/sync/manifest', readLimiter, async (_req, res) => {
   try {
     const db = await getDb();
     const [meta, docs] = await Promise.all([
       getGlobalMeta(db),
       db
         .collection('sync_kv')
-        .find({}, { projection: { _id: 0, key: 1, value: 1, updatedAt: 1 } })
+        .aggregate([
+          {
+            $project: {
+              _id: 0,
+              key: 1,
+              updatedAt: 1,
+              sizeBytes: { $bsonSize: { $ifNull: ['$value', ''] } },
+            },
+          },
+        ])
+        .toArray()
+        .catch(() =>
+          db
+            .collection('sync_kv')
+            .find({}, { projection: { _id: 0, key: 1, updatedAt: 1 } })
+            .toArray()
+        ),
+    ]);
+
+    const keys = docs
+      .filter((d) => d && typeof d.key === 'string' && ALLOWED_SYNC_KEYS.has(d.key))
+      .map((d) => ({
+        key: d.key,
+        updatedAt: d.updatedAt || null,
+        sizeBytes: typeof d.sizeBytes === 'number' ? d.sizeBytes : null,
+      }));
+
+    res.set('Cache-Control', 'no-store');
+    return res.json({
+      ok: true,
+      revision: meta.revision,
+      updatedAt: meta.updatedAt,
+      keys,
+    });
+  } catch (err) {
+    console.error('GET /api/sync/manifest error:', err && err.message);
+    return res.status(500).json({ ok: false, message: 'خطا در دریافت فهرست کلیدهای همگام‌سازی' });
+  }
+});
+
+app.get('/api/sync', readLimiter, async (req, res) => {
+  try {
+    const db = await getDb();
+    const rawKeysParam = typeof req.query.keys === 'string' ? req.query.keys.trim() : '';
+    const requestedKeys = rawKeysParam
+      ? rawKeysParam
+          .split(',')
+          .map((s) => s.trim())
+          .filter((k) => k && ALLOWED_SYNC_KEYS.has(k))
+      : null;
+
+    const filter =
+      requestedKeys && requestedKeys.length > 0 ? { key: { $in: requestedKeys } } : {};
+
+    const [meta, docs] = await Promise.all([
+      getGlobalMeta(db),
+      db
+        .collection('sync_kv')
+        .find(filter, { projection: { _id: 0, key: 1, value: 1, updatedAt: 1 } })
         .toArray(),
     ]);
 
@@ -426,12 +496,15 @@ app.get('/api/sync', readLimiter, async (req, res) => {
       }
     }
 
-    const etag = makeWeakEtag(`sync:${meta.revision}:${docs.length}:${latestUpdatedAt}`);
-    res.set('ETag', etag);
-    res.set('Cache-Control', 'private, no-cache');
-
-    if (req.headers['if-none-match'] && req.headers['if-none-match'] === etag) {
-      return res.status(304).end();
+    if (!requestedKeys) {
+      const etag = makeWeakEtag(`sync:${meta.revision}:${docs.length}:${latestUpdatedAt}`);
+      res.set('ETag', etag);
+      res.set('Cache-Control', 'private, no-cache');
+      if (req.headers['if-none-match'] && req.headers['if-none-match'] === etag) {
+        return res.status(304).end();
+      }
+    } else {
+      res.set('Cache-Control', 'no-store');
     }
 
     return res.json(kvMap);
@@ -514,11 +587,42 @@ app.post('/api/sync/batch', writeLimiter, requireSyncTokenIfConfigured, async (r
 });
 
 // ============================================================================
-// Dedicated Students Endpoints
+// Dedicated Students Endpoints (Compatible with Legacy + New Payloads)
 // ============================================================================
 app.get('/api/students', readLimiter, async (req, res) => {
   try {
     const db = await getDb();
+    const hasPagination = req.query.limit !== undefined || req.query.skip !== undefined;
+
+    if (hasPagination) {
+      const skip = Math.max(0, Number.parseInt(String(req.query.skip || '0'), 10) || 0);
+      const rawLimit = Number.parseInt(String(req.query.limit || '400'), 10) || 400;
+      const limit = Math.min(Math.max(rawLimit, 1), 800);
+
+      const [total, students] = await Promise.all([
+        db.collection('students').countDocuments({}),
+        db
+          .collection('students')
+          .find({}, { projection: { _id: 0 } })
+          .sort({ studentId: 1 })
+          .skip(skip)
+          .limit(limit)
+          .toArray(),
+      ]);
+
+      const nextSkip = skip + students.length;
+      res.set('Cache-Control', 'no-store');
+      return res.json({
+        ok: true,
+        total,
+        skip,
+        limit,
+        hasMore: nextSkip < total && students.length > 0,
+        nextSkip,
+        students,
+      });
+    }
+
     const [meta, students] = await Promise.all([
       getGlobalMeta(db),
       db
@@ -596,6 +700,11 @@ app.post('/api/students', writeLimiter, requireSyncTokenIfConfigured, async (req
     await db.collection('students').bulkWrite(ops, { ordered: false });
     if (body && body.replaceAll === true && validIds.size > 0) {
       await db.collection('students').deleteMany({ studentId: { $nin: Array.from(validIds) } });
+    } else if (body && Array.isArray(body.keepStudentIds) && body.keepStudentIds.length > 0) {
+      const keepIds = body.keepStudentIds.map((id) => String(id || '').trim()).filter(Boolean);
+      if (keepIds.length > 0) {
+        await db.collection('students').deleteMany({ studentId: { $nin: keepIds } });
+      }
     }
     const revision = await bumpGlobalRevision(db);
 
@@ -630,7 +739,7 @@ app.delete('/api/students/:studentId', writeLimiter, requireSyncTokenIfConfigure
 });
 
 // ============================================================================
-// Avatar / Profile Photo Endpoints
+// Avatar / Profile Photo Endpoints (Binary Storage, Batch Upload & Paginated Export)
 // ============================================================================
 app.post('/api/photos/batch', writeLimiter, requireSyncTokenIfConfigured, async (req, res) => {
   try {
