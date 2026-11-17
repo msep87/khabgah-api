@@ -1,17 +1,24 @@
 {
   "name": "khabgah-api",
-  "version": "1.0.0",
-  "description": "Backend API for Farhangian Isfahan Dormitory Management System",
+  "version": "2.0.0",
+  "description": "High-performance, security-hardened Express + MongoDB Atlas backend for Farhangian Dormitory Portal",
+  "private": true,
+  "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "dependencies": {
+    "@google/genai": "^1.0.0",
+    "compression": "^1.7.5",
     "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "mongoose": "^8.5.0"
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "helmet": "^8.0.0",
+    "mongodb": "^6.13.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   }
 }
