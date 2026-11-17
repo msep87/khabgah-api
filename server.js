@@ -1,17 +1,29 @@
-import 'dotenv/config';
-import crypto from 'node:crypto';
-import express from 'express';
-import cors from 'cors';
-import compression from 'compression';
-import helmet from 'helmet';
-import { MongoClient } from 'mongodb';
+require('dotenv').config();
+const crypto = require('node:crypto');
+const express = require('express');
+const cors = require('cors');
+const { MongoClient } = require('mongodb');
+
+let compression = null;
+try {
+  compression = require('compression');
+} catch {
+  compression = null;
+}
+
+let helmet = null;
+try {
+  helmet = require('helmet');
+} catch {
+  helmet = null;
+}
 
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 
 // ============================================================================
-// Security Allowlists & Configuration
+// Security Allowlists & Input Sanitization
 // ============================================================================
 const ALLOWED_SYNC_KEYS = new Set([
   'farhangian_dorm_settings_prod',
@@ -76,7 +88,7 @@ const ALLOWED_PHOTO_ROLES = new Set([
   'vice_dean',
 ]);
 
-const MAX_PHOTO_BYTES = 2 * 1024 * 1024; // 2MB per avatar/photo
+const MAX_PHOTO_BYTES = 2 * 1024 * 1024;
 const DISALLOWED_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 function sanitizePayload(value, depth = 0) {
@@ -94,49 +106,69 @@ function sanitizePayload(value, depth = 0) {
 }
 
 // ============================================================================
-// Middlewares: Helmet, Compression, Strict CORS, JSON Parser, Rate Limiter
+// Middlewares: CORS (Preflight First), Security Headers, Compression, JSON
 // ============================================================================
-app.use(
-  helmet({
-    crossOriginResourcePolicy: { policy: 'cross-origin' },
-    contentSecurityPolicy: false,
-  })
-);
-
-app.use(compression({ threshold: 1024 }));
-
 const rawAllowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
-  .map((s) => s.trim())
+  .map((s) => s.trim().replace(/\/+$/, ''))
   .filter(Boolean);
 
-app.use(
-  cors({
-    origin(origin, callback) {
-      if (!origin) return callback(null, true);
-      if (rawAllowedOrigins.length === 0) return callback(null, true);
-      if (rawAllowedOrigins.includes('*') || rawAllowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
-      return callback(new Error('Origin not allowed by CORS policy'));
-    },
-    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'If-None-Match', 'X-Sync-Token'],
-    exposedHeaders: ['ETag'],
-    maxAge: 86400,
-  })
-);
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin || rawAllowedOrigins.length === 0 || rawAllowedOrigins.includes('*')) {
+      return callback(null, true);
+    }
+    const cleanOrigin = String(origin).trim().replace(/\/+$/, '');
+    if (rawAllowedOrigins.includes(cleanOrigin)) {
+      return callback(null, true);
+    }
+    return callback(new Error('Origin not allowed by CORS policy'));
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'If-None-Match',
+    'X-Sync-Token',
+    'Cache-Control',
+    'Pragma',
+  ],
+  exposedHeaders: ['ETag'],
+  maxAge: 86400,
+};
 
-app.use(express.json({ limit: '6mb' }));
+app.use(cors(corsOptions));
 
-// Sliding-window in-memory rate limiter (bounded Map to prevent unbounded memory growth)
+if (helmet) {
+  app.use(
+    helmet({
+      crossOriginResourcePolicy: { policy: 'cross-origin' },
+      crossOriginEmbedderPolicy: false,
+      crossOriginOpenerPolicy: false,
+      contentSecurityPolicy: false,
+    })
+  );
+} else {
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    next();
+  });
+}
+
+if (compression) {
+  app.use(compression({ threshold: 512 }));
+}
+
+app.use(express.json({ limit: '5mb' }));
+
 const rateBuckets = new Map();
 function createRateLimiter({ windowMs, maxRequests, keyPrefix }) {
   return (req, res, next) => {
+    if (req.method === 'OPTIONS') return next();
+    const forwarded = req.headers['x-forwarded-for'];
     const ip =
-      (typeof req.headers['x-forwarded-for'] === 'string'
-        ? req.headers['x-forwarded-for'].split(',')[0].trim()
-        : '') ||
+      (typeof forwarded === 'string' ? forwarded.split(',')[0].trim() : '') ||
       req.ip ||
       'unknown';
     const bucketKey = `${keyPrefix}:${ip}`;
@@ -164,9 +196,9 @@ function createRateLimiter({ windowMs, maxRequests, keyPrefix }) {
   };
 }
 
-const readLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 240, keyPrefix: 'r' });
-const writeLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 120, keyPrefix: 'w' });
-const aiLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 20, keyPrefix: 'ai' });
+const readLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 300, keyPrefix: 'r' });
+const writeLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 150, keyPrefix: 'w' });
+const aiLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 25, keyPrefix: 'ai' });
 
 function requireSyncTokenIfConfigured(req, res, next) {
   const configuredToken = (process.env.CLOUD_SYNC_API_TOKEN || '').trim();
@@ -189,24 +221,73 @@ function requireSyncTokenIfConfigured(req, res, next) {
 }
 
 // ============================================================================
-// Singleton Pooled MongoDB Atlas Connection + Index Initialization
+// Serverless-Optimized MongoDB Atlas Connection & Auto DB Name Resolution
 // ============================================================================
-const MONGO_URI = process.env.MONGODB_URI || '';
-const DB_NAME = process.env.MONGODB_DB_NAME || 'khabgah_db';
+function extractDbNameFromUri(uri) {
+  try {
+    if (!uri) return '';
+    const cleaned = uri.replace(/^mongodb(\+srv)?:\/\//i, 'https://');
+    const parsed = new URL(cleaned);
+    return decodeURIComponent(parsed.pathname || '').replace(/^\/+|\/+$/g, '');
+  } catch {
+    return '';
+  }
+}
+
+async function resolveDatabase(client) {
+  if (globalThis._khabgahResolvedDbName) {
+    return client.db(globalThis._khabgahResolvedDbName);
+  }
+
+  const explicitEnvDb = (process.env.MONGODB_DB_NAME || '').trim();
+  if (explicitEnvDb) {
+    globalThis._khabgahResolvedDbName = explicitEnvDb;
+    return client.db(explicitEnvDb);
+  }
+
+  const uriDb = extractDbNameFromUri((process.env.MONGODB_URI || '').trim());
+  const candidates = [];
+  if (uriDb) candidates.push(uriDb);
+  if (!candidates.includes('khabgah_db')) candidates.push('khabgah_db');
+  if (!candidates.includes('test')) candidates.push('test');
+
+  for (const name of candidates) {
+    try {
+      const candidateDb = client.db(name);
+      const [kvCount, stCount] = await Promise.all([
+        candidateDb.collection('sync_kv').estimatedDocumentCount().catch(() => 0),
+        candidateDb.collection('students').estimatedDocumentCount().catch(() => 0),
+      ]);
+      if (kvCount > 0 || stCount > 0) {
+        globalThis._khabgahResolvedDbName = name;
+        return candidateDb;
+      }
+    } catch {
+      // continue checking next candidate
+    }
+  }
+
+  const defaultDbName = uriDb || 'khabgah_db';
+  globalThis._khabgahResolvedDbName = defaultDbName;
+  return client.db(defaultDbName);
+}
 
 async function getDb() {
-  if (!MONGO_URI) {
-    throw new Error('MONGODB_URI is not configured');
+  const mongoUri = (process.env.MONGODB_URI || '').trim();
+  if (!mongoUri) {
+    const err = new Error('MONGODB_URI is not configured');
+    err.code = 'MONGODB_URI_MISSING';
+    throw err;
   }
 
   if (!globalThis._khabgahMongoPromise) {
-    const client = new MongoClient(MONGO_URI, {
-      maxPoolSize: 10,
-      minPoolSize: 1,
-      maxIdleTimeMS: 60_000,
-      serverSelectionTimeoutMS: 5_000,
+    const client = new MongoClient(mongoUri, {
+      maxPoolSize: 5,
+      minPoolSize: 0,
+      maxIdleTimeMS: 30_000,
+      connectTimeoutMS: 10_000,
+      serverSelectionTimeoutMS: 10_000,
       socketTimeoutMS: 20_000,
-      compressors: ['zlib'],
     });
     globalThis._khabgahMongoPromise = client.connect().catch((err) => {
       globalThis._khabgahMongoPromise = null;
@@ -214,16 +295,24 @@ async function getDb() {
     });
   }
 
-  const connectedClient = await globalThis._khabgahMongoPromise;
-  const db = connectedClient.db(DB_NAME);
+  let connectedClient;
+  try {
+    connectedClient = await globalThis._khabgahMongoPromise;
+  } catch (err) {
+    globalThis._khabgahMongoPromise = null;
+    throw err;
+  }
+
+  const db = await resolveDatabase(connectedClient);
 
   if (!globalThis._khabgahIndexesPromise) {
     globalThis._khabgahIndexesPromise = Promise.all([
-      db.collection('sync_kv').createIndex({ key: 1 }, { unique: true, background: true }),
-      db.collection('students').createIndex({ studentId: 1 }, { unique: true, background: true }),
-      db.collection('photos').createIndex({ role: 1, userId: 1 }, { unique: true, background: true }),
-      db.collection('sync_meta').createIndex({ id: 1 }, { unique: true, background: true }),
-    ]).catch(() => {
+      db.collection('sync_kv').createIndex({ key: 1 }, { unique: true }),
+      db.collection('students').createIndex({ studentId: 1 }, { unique: true }),
+      db.collection('photos').createIndex({ role: 1, userId: 1 }, { unique: true }),
+      db.collection('sync_meta').createIndex({ id: 1 }, { unique: true }),
+    ]).catch((err) => {
+      console.warn('Mongo index initialization warning:', err && err.message);
       globalThis._khabgahIndexesPromise = null;
     });
   }
@@ -241,7 +330,7 @@ async function bumpGlobalRevision(db) {
     },
     { upsert: true, returnDocument: 'after' }
   );
-  return result?.revision ?? Date.now();
+  return (result && result.revision) || (result && result.value && result.value.revision) || Date.now();
 }
 
 async function getGlobalMeta(db) {
@@ -249,8 +338,8 @@ async function getGlobalMeta(db) {
     .collection('sync_meta')
     .findOne({ id: 'global' }, { projection: { _id: 0, revision: 1, updatedAt: 1 } });
   return {
-    revision: meta?.revision ?? 0,
-    updatedAt: meta?.updatedAt ?? null,
+    revision: (meta && meta.revision) ?? 0,
+    updatedAt: (meta && meta.updatedAt) ?? null,
   };
 }
 
@@ -260,15 +349,44 @@ function makeWeakEtag(raw) {
 }
 
 // ============================================================================
-// Health & Version Endpoints
+// Root, Health & Version Endpoints
 // ============================================================================
+app.get('/', (_req, res) => {
+  res.json({ ok: true, service: 'khabgah-api', status: 'running', health: '/api/health' });
+});
+
+app.get('/api', (_req, res) => {
+  res.json({ ok: true, service: 'khabgah-api', status: 'running', health: '/api/health' });
+});
+
 app.get('/api/health', readLimiter, async (_req, res) => {
   try {
     const db = await getDb();
     await db.command({ ping: 1 });
-    res.json({ ok: true, status: 'healthy', timestamp: new Date().toISOString() });
-  } catch {
-    res.status(503).json({ ok: false, status: 'unavailable' });
+    const [syncKv, students, photos] = await Promise.all([
+      db.collection('sync_kv').countDocuments({}).catch(() => 0),
+      db.collection('students').countDocuments({}).catch(() => 0),
+      db.collection('photos').countDocuments({}).catch(() => 0),
+    ]);
+    res.set('Cache-Control', 'no-store');
+    return res.json({
+      ok: true,
+      status: 'healthy',
+      dbName: db.databaseName,
+      counts: { syncKv, students, photos },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    const code = err && err.code === 'MONGODB_URI_MISSING' ? 'MONGODB_URI_MISSING' : 'DB_UNAVAILABLE';
+    return res.status(503).json({
+      ok: false,
+      status: 'unavailable',
+      code,
+      message:
+        code === 'MONGODB_URI_MISSING'
+          ? 'متغیر محیطی MONGODB_URI در تنظیمات سرور Vercel تعریف نشده است.'
+          : 'عدم امکان برقراری ارتباط با پایگاه داده MongoDB Atlas.',
+    });
   }
 });
 
@@ -277,25 +395,38 @@ app.get('/api/sync/version', readLimiter, async (_req, res) => {
     const db = await getDb();
     const meta = await getGlobalMeta(db);
     res.set('Cache-Control', 'no-store');
-    res.json({ ok: true, revision: meta.revision, updatedAt: meta.updatedAt });
+    return res.json({ ok: true, revision: meta.revision, updatedAt: meta.updatedAt });
   } catch {
-    res.status(500).json({ ok: false, message: 'خطا در بررسی نسخه سرور' });
+    return res.status(500).json({ ok: false, message: 'خطا در بررسی نسخه سرور' });
   }
 });
 
 // ============================================================================
-// Sync Endpoints (GET, POST single, POST batch) with ETag / 304 Not Modified
+// Sync Endpoints (GET, POST single, POST batch)
 // ============================================================================
 app.get('/api/sync', readLimiter, async (req, res) => {
   try {
     const db = await getDb();
-    const meta = await getGlobalMeta(db);
-    const docs = await db
-      .collection('sync_kv')
-      .find({}, { projection: { _id: 0, key: 1, value: 1, updatedAt: 1 } })
-      .toArray();
+    const [meta, docs] = await Promise.all([
+      getGlobalMeta(db),
+      db
+        .collection('sync_kv')
+        .find({}, { projection: { _id: 0, key: 1, value: 1, updatedAt: 1 } })
+        .toArray(),
+    ]);
 
-    const etag = makeWeakEtag(`sync:${meta.revision}:${docs.length}`);
+    let latestUpdatedAt = '';
+    const kvMap = {};
+    for (const doc of docs) {
+      if (doc && typeof doc.key === 'string' && ALLOWED_SYNC_KEYS.has(doc.key)) {
+        kvMap[doc.key] = doc.value;
+        if (typeof doc.updatedAt === 'string' && doc.updatedAt > latestUpdatedAt) {
+          latestUpdatedAt = doc.updatedAt;
+        }
+      }
+    }
+
+    const etag = makeWeakEtag(`sync:${meta.revision}:${docs.length}:${latestUpdatedAt}`);
     res.set('ETag', etag);
     res.set('Cache-Control', 'private, no-cache');
 
@@ -303,15 +434,9 @@ app.get('/api/sync', readLimiter, async (req, res) => {
       return res.status(304).end();
     }
 
-    const kvMap = {};
-    for (const doc of docs) {
-      if (doc && typeof doc.key === 'string' && ALLOWED_SYNC_KEYS.has(doc.key)) {
-        kvMap[doc.key] = doc.value;
-      }
-    }
-
     return res.json(kvMap);
-  } catch {
+  } catch (err) {
+    console.error('GET /api/sync error:', err && err.message);
     return res.status(500).json({ ok: false, message: 'خطا در دریافت داده‌های همگام‌سازی' });
   }
 });
@@ -338,14 +463,15 @@ app.post('/api/sync', writeLimiter, requireSyncTokenIfConfigured, async (req, re
 
     const revision = await bumpGlobalRevision(db);
     return res.json({ ok: true, key, revision });
-  } catch {
+  } catch (err) {
+    console.error('POST /api/sync error:', err && err.message);
     return res.status(500).json({ ok: false, message: 'خطا در ذخیره‌سازی داده در پایگاه داده' });
   }
 });
 
 app.post('/api/sync/batch', writeLimiter, requireSyncTokenIfConfigured, async (req, res) => {
   try {
-    const entries = req.body?.entries;
+    const entries = req.body && req.body.entries;
     if (!Array.isArray(entries) || entries.length === 0 || entries.length > 60) {
       return res.status(400).json({ ok: false, message: 'فهرست دسته‌ای همگام‌سازی نامعتبر است.' });
     }
@@ -381,24 +507,34 @@ app.post('/api/sync/batch', writeLimiter, requireSyncTokenIfConfigured, async (r
     const revision = await bumpGlobalRevision(db);
 
     return res.json({ ok: true, count: ops.length, revision });
-  } catch {
+  } catch (err) {
+    console.error('POST /api/sync/batch error:', err && err.message);
     return res.status(500).json({ ok: false, message: 'خطا در ذخیره‌سازی دسته‌ای داده‌ها' });
   }
 });
 
 // ============================================================================
-// Dedicated Students Endpoints with ETag & Safe Record Handling
+// Dedicated Students Endpoints
 // ============================================================================
 app.get('/api/students', readLimiter, async (req, res) => {
   try {
     const db = await getDb();
-    const meta = await getGlobalMeta(db);
-    const students = await db
-      .collection('students')
-      .find({}, { projection: { _id: 0 } })
-      .toArray();
+    const [meta, students] = await Promise.all([
+      getGlobalMeta(db),
+      db
+        .collection('students')
+        .find({}, { projection: { _id: 0 } })
+        .toArray(),
+    ]);
 
-    const etag = makeWeakEtag(`students:${meta.revision}:${students.length}`);
+    let latestUpdatedAt = '';
+    for (const s of students) {
+      if (s && typeof s.updatedAt === 'string' && s.updatedAt > latestUpdatedAt) {
+        latestUpdatedAt = s.updatedAt;
+      }
+    }
+
+    const etag = makeWeakEtag(`students:${meta.revision}:${students.length}:${latestUpdatedAt}`);
     res.set('ETag', etag);
     res.set('Cache-Control', 'private, no-cache');
 
@@ -407,7 +543,8 @@ app.get('/api/students', readLimiter, async (req, res) => {
     }
 
     return res.json(students);
-  } catch {
+  } catch (err) {
+    console.error('GET /api/students error:', err && err.message);
     return res.status(500).json({ ok: false, message: 'خطا در دریافت فهرست دانشجویان' });
   }
 });
@@ -415,11 +552,11 @@ app.get('/api/students', readLimiter, async (req, res) => {
 app.post('/api/students', writeLimiter, requireSyncTokenIfConfigured, async (req, res) => {
   try {
     const body = sanitizePayload(req.body || {});
-    const listInput = Array.isArray(body?.students)
+    const listInput = Array.isArray(body && body.students)
       ? body.students
-      : body?.student && typeof body.student === 'object'
+      : body && body.student && typeof body.student === 'object'
       ? [body.student]
-      : body?.studentId
+      : body && body.studentId
       ? [body]
       : [];
 
@@ -437,7 +574,10 @@ app.post('/api/students', writeLimiter, requireSyncTokenIfConfigured, async (req
       const studentId = String(rawStudent.studentId).trim();
       if (!studentId || studentId.length > 64) continue;
       validIds.add(studentId);
-      const doc = { ...rawStudent, studentId, updatedAt: nowIso };
+      const { _id, __v, ...cleanFields } = rawStudent;
+      void _id;
+      void __v;
+      const doc = { ...cleanFields, studentId, updatedAt: nowIso };
       if (!firstValid) firstValid = doc;
       ops.push({
         updateOne: {
@@ -454,7 +594,7 @@ app.post('/api/students', writeLimiter, requireSyncTokenIfConfigured, async (req
 
     const db = await getDb();
     await db.collection('students').bulkWrite(ops, { ordered: false });
-    if (body?.replaceAll === true && validIds.size > 0) {
+    if (body && body.replaceAll === true && validIds.size > 0) {
       await db.collection('students').deleteMany({ studentId: { $nin: Array.from(validIds) } });
     }
     const revision = await bumpGlobalRevision(db);
@@ -466,7 +606,8 @@ app.post('/api/students', writeLimiter, requireSyncTokenIfConfigured, async (req
       revision,
       message: 'اطلاعات دانشجو با موفقیت در پایگاه داده ثبت شد.',
     });
-  } catch {
+  } catch (err) {
+    console.error('POST /api/students error:', err && err.message);
     return res.status(500).json({ ok: false, message: 'خطا در ثبت اطلاعات دانشجو' });
   }
 });
@@ -482,17 +623,18 @@ app.delete('/api/students/:studentId', writeLimiter, requireSyncTokenIfConfigure
     await db.collection('students').deleteOne({ studentId });
     const revision = await bumpGlobalRevision(db);
     return res.json({ ok: true, revision });
-  } catch {
+  } catch (err) {
+    console.error('DELETE /api/students/:studentId error:', err && err.message);
     return res.status(500).json({ ok: false, message: 'خطا در حذف پرونده دانشجو' });
   }
 });
 
 // ============================================================================
-// Avatar / Profile Photo Endpoints (Binary Storage + ETag + Immutable Caching)
+// Avatar / Profile Photo Endpoints
 // ============================================================================
 app.post('/api/photos/batch', writeLimiter, requireSyncTokenIfConfigured, async (req, res) => {
   try {
-    const items = req.body?.items;
+    const items = req.body && req.body.items;
     if (!Array.isArray(items) || items.length === 0 || items.length > 30) {
       return res.status(400).json({ ok: false, message: 'فهرست تصاویر ارسالی نامعتبر است.' });
     }
@@ -504,9 +646,9 @@ app.post('/api/photos/batch', writeLimiter, requireSyncTokenIfConfigured, async 
     const urls = {};
 
     for (const item of items) {
-      const role = String(item?.role || '').trim();
-      const userId = String(item?.userId || '').trim();
-      const dataUrl = String(item?.dataUrl || '').trim();
+      const role = String((item && item.role) || '').trim();
+      const userId = String((item && item.userId) || '').trim();
+      const dataUrl = String((item && item.dataUrl) || '').trim();
 
       if (!ALLOWED_PHOTO_ROLES.has(role) || !userId || userId.length > 100) {
         return res.status(400).json({ ok: false, message: 'نقش یا شناسه کاربر برای بارگذاری تصویر نامعتبر است.' });
@@ -556,7 +698,8 @@ app.post('/api/photos/batch', writeLimiter, requireSyncTokenIfConfigured, async 
     await db.collection('photos').bulkWrite(ops, { ordered: false });
 
     return res.json({ ok: true, count: ops.length, urls });
-  } catch {
+  } catch (err) {
+    console.error('POST /api/photos/batch error:', err && err.message);
     return res.status(500).json({ ok: false, message: 'خطا در ذخیره‌سازی ابری تصاویر' });
   }
 });
@@ -622,7 +765,8 @@ app.get('/api/photos/export', readLimiter, async (req, res) => {
       nextSkip,
       photos,
     });
-  } catch {
+  } catch (err) {
+    console.error('GET /api/photos/export error:', err && err.message);
     return res.status(500).json({ ok: false, message: 'خطا در استخراج فایل‌های تصویری از سرور' });
   }
 });
@@ -658,13 +802,14 @@ app.get('/api/photo/:role/:userId', readLimiter, async (req, res) => {
     }
 
     return res.send(buffer);
-  } catch {
+  } catch (err) {
+    console.error('GET /api/photo/:role/:userId error:', err && err.message);
     return res.status(500).end();
   }
 });
 
 // ============================================================================
-// Optional Server-Side Gemini Assistant Proxy (API Key Never Exposed to Client)
+// Optional Server-Side Gemini Assistant Proxy
 // ============================================================================
 app.post('/api/ai-chat', aiLimiter, async (req, res) => {
   const apiKey = (process.env.GEMINI_API_KEY || '').trim();
@@ -676,15 +821,16 @@ app.post('/api/ai-chat', aiLimiter, async (req, res) => {
   }
 
   try {
-    const message = String(req.body?.message || '').trim().slice(0, 4000);
+    const message = String((req.body && req.body.message) || '').trim().slice(0, 4000);
     if (!message) {
       return res.status(400).json({ ok: false, message: 'متن پرسش نمی‌تواند خالی باشد.' });
     }
 
-    const history = Array.isArray(req.body?.history) ? req.body.history.slice(-8) : [];
-    const publicContext = sanitizePayload(req.body?.publicContext || {});
+    const history = Array.isArray(req.body && req.body.history) ? req.body.history.slice(-8) : [];
+    const publicContext = sanitizePayload((req.body && req.body.publicContext) || {});
 
-    const { GoogleGenAI } = await import('@google/genai');
+    const genaiMod = await import('@google/genai');
+    const GoogleGenAI = genaiMod.GoogleGenAI;
     const ai = new GoogleGenAI({ apiKey });
 
     const systemInstruction =
@@ -693,8 +839,8 @@ app.post('/api/ai-chat', aiLimiter, async (req, res) => {
 
     const contents = [
       ...history.map((item) => ({
-        role: item?.role === 'model' ? 'model' : 'user',
-        parts: [{ text: String(item?.text || '').slice(0, 2000) }],
+        role: item && item.role === 'model' ? 'model' : 'user',
+        parts: [{ text: String((item && item.text) || '').slice(0, 2000) }],
       })),
       {
         role: 'user',
@@ -712,9 +858,10 @@ app.post('/api/ai-chat', aiLimiter, async (req, res) => {
       config: { systemInstruction },
     });
 
-    const reply = response?.text || 'پاسخی دریافت نشد.';
+    const reply = (response && response.text) || 'پاسخی دریافت نشد.';
     return res.json({ ok: true, reply, sources: [] });
-  } catch {
+  } catch (err) {
+    console.error('POST /api/ai-chat error:', err && err.message);
     return res.status(500).json({
       ok: false,
       message: 'خطا در برقراری ارتباط با سرویس دستیار هوشمند.',
@@ -723,27 +870,27 @@ app.post('/api/ai-chat', aiLimiter, async (req, res) => {
 });
 
 // ============================================================================
-// 404 & Sanitized Error Handler (Never Leak Stack Traces or Secrets)
+// 404 & Error Handlers
 // ============================================================================
 app.use((_req, res) => {
   res.status(404).json({ ok: false, message: 'مسیر درخواستی یافت نشد.' });
 });
 
 app.use((err, _req, res, _next) => {
-  if (err?.type === 'entity.too.large') {
+  if (err && err.type === 'entity.too.large') {
     return res.status(413).json({ ok: false, message: 'حجم داده‌های ارسالی بیش از حد مجاز است.' });
   }
-  if (err?.message?.includes('CORS')) {
+  if (err && typeof err.message === 'string' && err.message.includes('CORS')) {
     return res.status(403).json({ ok: false, message: 'دسترسی از این دامنه مجاز نیست.' });
   }
   return res.status(500).json({ ok: false, message: 'خطای داخلی سرور' });
 });
 
-if (!process.env.VERCEL) {
+if (!process.env.VERCEL && require.main === module) {
   const port = Number(process.env.PORT || 4000);
   app.listen(port, () => {
     console.log(`khabgah-api backend listening on port ${port}`);
   });
 }
 
-export default app;
+module.exports = app;
