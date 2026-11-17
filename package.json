@@ -1,24 +1,24 @@
 {
   "name": "khabgah-api",
   "version": "2.0.0",
-  "description": "High-performance, security-hardened Express + MongoDB Atlas backend for Farhangian Dormitory Portal",
-  "private": true,
-  "type": "module",
+  "description": "Backend API server for Farhangian University Dormitory Management Portal (MongoDB Atlas + Vercel Serverless)",
   "main": "server.js",
+  "type": "commonjs",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   },
   "dependencies": {
-    "@google/genai": "^1.0.0",
     "compression": "^1.7.5",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "helmet": "^8.0.0",
-    "mongodb": "^6.13.0"
+    "mongodb": "^6.12.0"
   },
-  "engines": {
-    "node": ">=20.0.0"
+  "optionalDependencies": {
+    "@google/genai": "^1.0.0"
   }
 }
