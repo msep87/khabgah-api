@@ -920,14 +920,123 @@ app.get('/api/photo/:role/:userId', readLimiter, async (req, res) => {
 // ============================================================================
 // Optional Server-Side Gemini Assistant Proxy
 // ============================================================================
-app.post('/api/ai-chat', aiLimiter, async (req, res) => {
-  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
-  if (!apiKey) {
-    return res.status(503).json({
-      ok: false,
-      message: 'کلید سرویس دستیار هوشمند در سرور تنظیم نشده است.',
-    });
+app.post('/api/ai-chat', async (req, res) => {
+  try {
+    const { message, publicContext, studentInfo } = req.body || {};
+    const apiKey = (process.env.GROQ_API_KEY || process.env.GEMINI_API_KEY || '').trim();
+
+    if (!apiKey) {
+      return res.status(500).json({ 
+        ok: false,
+        reply: 'کلید API در تنظیمات سرور (Vercel Environment Variables) یافت نشد.' 
+      });
+    }
+
+    // خلاصه‌سازی داده‌ها برای جلوگیری از خطای طولانی بودن پیام
+    const cleanAndTruncate = (obj, maxLength = 2500) => {
+      if (!obj) return '';
+      try {
+        const str = typeof obj === 'string' ? obj : JSON.stringify(obj, (key, value) => {
+          if (typeof value === 'string' && (value.startsWith('data:image') || value.length > 500)) {
+            return '[تصویر/متن طولانی حذف شد]';
+          }
+          return value;
+        });
+        return str.length > maxLength ? str.substring(0, maxLength) + '... [خلاصه شده]' : str;
+      } catch (e) {
+        return '';
+      }
+    };
+
+    const safeContext = cleanAndTruncate(publicContext, 2500);
+    const safeStudent = cleanAndTruncate(studentInfo, 800);
+    const safeMessage = String(message || 'سلام').substring(0, 1000);
+
+    const systemInstruction = `
+تو دستیار هوشمند رسمی «سامانه اسکان و امور سراهای دانشجویی دانشگاه فرهنگیان اصفهان» هستی.
+به سوالات دانشجویان درباره اطلاعات سراها، اطلاعیه‌ها، مسائل خوابگاهی و آموزشی به زبان فارسی روان و محترمانه پاسخ بده.
+خط قرمز امنیتی: هرگز اطلاعات شخصی و حساس (کد ملی، شماره تماس، رمز عبور، آدرس و محل اسکان سایر افراد) را فاش نکن.
+
+خلاصه اطلاعات سامانه:
+${safeContext}
+
+اطلاعات کاربر فعلی:
+${safeStudent || 'کاربر مهمان'}
+`.trim();
+
+    // دریافت لیست مدل‌های فعال اکانت Groq
+    let candidateModels = [
+      'meta-llama/llama-4-scout-17b-16e-instruct',
+      'meta-llama/llama-4-maverick-17b-128e-instruct',
+      'llama-3.1-8b-instant',
+      'qwen-qwq-32b',
+      'gemma2-9b-it'
+    ];
+
+    try {
+      const modelsRes = await fetch('https://api.groq.com/openai/v1/models', {
+        headers: { 'Authorization': `Bearer ${apiKey}` }
+      });
+      if (modelsRes.ok) {
+        const modelsData = await modelsRes.json();
+        const availableIds = (modelsData.data || [])
+          .map(m => m.id)
+          .filter(id => 
+            !id.includes('whisper') && 
+            !id.includes('tts') && 
+            !id.includes('guard') && 
+            !id.includes('allam') &&
+            !id.includes('vision')
+          );
+
+        const prioritized = candidateModels.filter(m => availableIds.includes(m));
+        const others = availableIds.filter(m => !prioritized.includes(m));
+        if (prioritized.length > 0 || others.length > 0) {
+          candidateModels = [...prioritized, ...others];
+        }
+      }
+    } catch (e) {
+      console.error('Error fetching models:', e);
+    }
+
+    let lastError = 'مدلی یافت نشد';
+    for (const modelName of candidateModels.slice(0, 4)) {
+      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          model: modelName,
+          messages: [
+            { role: 'system', content: systemInstruction },
+            { role: 'user', content: safeMessage }
+          ],
+          temperature: 0.5,
+          max_tokens: 512
+        })
+      });
+
+      const data = await response.json();
+
+      if (response.ok && data?.choices?.[0]?.message?.content) {
+        let reply = data.choices[0].message.content;
+        reply = reply.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+        // برگرداندن هر دو فرمت reply و text و answer برای سازگاری ۱۰۰٪ با هر تغییری در فرانت‌اند
+        return res.json({ ok: true, success: true, reply, text: reply, answer: reply, modelUsed: modelName });
+      } else {
+        lastError = `(${modelName}): ${data?.error?.message || 'خطا'}`;
+      }
+    }
+
+    return res.status(400).json({ ok: false, reply: `خطای سرویس هوش مصنوعی ${lastError}` });
+
+  } catch (error) {
+    console.error('AI Chat Server Error:', error);
+    res.status(500).json({ ok: false, reply: 'خطا در ارتباط سرور با هوش مصنوعی.' });
   }
+});
 
   try {
     const message = String((req.body && req.body.message) || '').trim().slice(0, 4000);
